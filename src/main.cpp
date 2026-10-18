@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.1
+// PickpocketPlus (OBSE64 plugin) — version 0.2
+// v0.2: logs Sneak XP before/after; if the pickpocket-action call changes nothing, falls back to the
+//       raw-usage UseSkill call. "PPAddSneakXP 0" just logs the current Sneak XP.
 //
 // Takes over one unused debug console command and turns it into:
 //     PPAddSneakXP <amount>        (short name: ppxp)
@@ -31,10 +33,6 @@ namespace PPXP
 			REX::WARN("PPAddSneakXP: could not read the amount");
 			return true;
 		}
-		if (amount <= 0.0f) {
-			return true;
-		}
-
 		auto player = RE::PlayerCharacter::GetSingleton();
 		auto data = RE::TESDataHandler::GetSingleton();
 		if (!player || !data) {
@@ -42,18 +40,34 @@ namespace PPXP
 			return true;
 		}
 
-		// The game gives pickpocket XP as "Sneak, action 1 (pickpocket) x modifier".
-		// Using the same path keeps our XP identical in kind to the game's own.
-		const auto& skill = data->skill[kSneak - kFirstSkill];
+		constexpr std::int32_t slot = kSneak - kFirstSkill;
+		auto& skill = data->skill[slot];
+		const auto avIndex = static_cast<RE::ActorValue::Index>(kSneak);
+
+		const float before = player->skillUsage[slot];
+		REX::INFO("Sneak XP now {:.3f} (advancement uses {:.3f}, skill level count {})",
+			before, player->skillAdvancementUses[slot], player->skillLevels[slot]);
+		if (amount <= 0.0f) {
+			return true;
+		}
+
+		// try 1: the same path the game uses for pickpocket XP (Sneak, action 1, x modifier)
 		float perUse = skill.data.actionValue[static_cast<std::int32_t>(RE::SKILL_ACTION::kPickPocket)];
 		if (perUse <= 0.0f) {
 			perUse = 1.0f;
 		}
 		const float modifier = amount / perUse;
+		player->UseSkill(avIndex, RE::SKILL_ACTION::kPickPocket, modifier);
+		const float after1 = player->skillUsage[slot];
+		REX::INFO("try 1 (action call, use value {:.2f}, modifier {:.3f}): Sneak XP {:.3f} -> {:.3f}", perUse, modifier, before, after1);
 
-		player->UseSkill(static_cast<RE::ActorValue::Index>(kSneak), RE::SKILL_ACTION::kPickPocket, modifier);
+		// try 2: raw usage call, only if try 1 changed nothing
+		if (after1 == before) {
+			player->UseSkill(avIndex, amount, std::addressof(skill));
+			const float after2 = player->skillUsage[slot];
+			REX::INFO("try 2 (raw usage call): Sneak XP {:.3f} -> {:.3f}", after1, after2);
+		}
 
-		REX::INFO("PPAddSneakXP: +{:.2f} Sneak XP (pickpocket use value {:.2f}, modifier {:.3f})", amount, perUse, modifier);
 		a_result = amount;
 		return true;
 	}
@@ -94,7 +108,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.1 loaded");
+	REX::INFO("PickpocketPlus 0.2 loaded");
 	PPXP::Install();
 	return true;
 }
