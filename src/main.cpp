@@ -86,7 +86,7 @@ namespace PPXP
 	};
 	RE::SCRIPT_PARAMETER g_stripParams[] = {
 		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
-		{ "skipQuestAndScripted", RE::SCRIPT_PARAM_TYPE::kInteger, true }
+		{ "skipQuestAndScripted", RE::SCRIPT_PARAM_TYPE::kInt, true }
 	};
 
 	// quest items and items with a script attached stay on the NPC (stealing them can break quests)
