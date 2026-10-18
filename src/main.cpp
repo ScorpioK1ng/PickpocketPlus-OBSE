@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.5
+// PickpocketPlus (OBSE64 plugin) — version 0.6
+// v0.6: target = the NPC you activated (falls back to the nearest NPC); the stripped NPC becomes the console's
+//       selected reference, so the UE4SS mod can refresh the steal menu with a quick additem/removeitem.
 // v0.5: worn-gear stealing (test build): PPStripTarget <maxDistance> unequips the nearest NPC's worn items,
 //       PPRestoreTarget re-equips whatever is left. All console commands are listed in the log once.
 // v0.4: adds the XP straight to the player's Sneak experience (the game's UseSkill calls did nothing / crashed).
@@ -67,6 +69,14 @@ namespace PPXP
 	// ---------------- worn gear ----------------
 	RE::TESFormID                     g_targetID = 0;
 	std::vector<RE::TESBoundObject*>  g_stripped;
+	RE::TESObjectREFR*                g_oldPick = nullptr;
+
+	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
+	{
+		return (a_ref && a_ref->Is(RE::FormType::ActorCharacter) && a_ref != RE::PlayerCharacter::GetSingleton()) ?
+		           static_cast<RE::Actor*>(a_ref) :
+		           nullptr;
+	}
 
 	RE::SCRIPT_PARAMETER g_distParams[] = {
 		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true }
@@ -110,7 +120,19 @@ namespace PPXP
 			maxDist = 300.0f;
 		}
 
-		auto npc = FindNearestNPC(maxDist);
+		auto im = RE::InterfaceManager::GetInstance(false, false);
+		RE::Actor* npc = nullptr;
+		if (im) {
+			npc = AsNPC(im->activateRef);
+			if (npc) {
+				REX::INFO("target from activation: {:08X}", npc->formID);
+			} else if ((npc = AsNPC(im->crosshairRef))) {
+				REX::INFO("target from crosshair: {:08X}", npc->formID);
+			}
+		}
+		if (!npc) {
+			npc = FindNearestNPC(maxDist);
+		}
 		if (!npc) {
 			REX::INFO("PPStripTarget: no NPC within {:.0f}", maxDist);
 			return true;
@@ -142,6 +164,12 @@ namespace PPXP
 			g_stripped.push_back(object);
 		}
 		REX::INFO("PPStripTarget: {} worn item(s) unequipped on {:08X}", g_stripped.size(), g_targetID);
+
+		// make the NPC the console's selected reference, so "additem"/"removeitem" from the UE4SS mod hit them
+		if (im) {
+			g_oldPick = im->pickRef;
+			im->pickRef = npc;
+		}
 		a_result = static_cast<double>(g_stripped.size());
 		return true;
 	}
@@ -171,6 +199,10 @@ namespace PPXP
 			}
 		}
 		REX::INFO("PPRestoreTarget: {} item(s) re-equipped on {:08X}", restored, g_targetID);
+		if (auto im = RE::InterfaceManager::GetInstance(false, false); im && im->pickRef == npc) {
+			im->pickRef = g_oldPick;
+		}
+		g_oldPick = nullptr;
 		a_result = restored;
 		g_stripped.clear();
 		g_targetID = 0;
@@ -199,13 +231,6 @@ namespace PPXP
 
 	void Install()
 	{
-		REX::INFO("console commands in this game version:");
-		for (auto& cmd : RE::SCRIPT_FUNCTION::GetConsoleFunctions()) {
-			if (cmd.functionName) {
-				REX::INFO("  {}", cmd.functionName);
-			}
-		}
-
 		// unused debug commands we may take over, in order
 		constexpr std::array victims{
 			"OutputMemContexts"sv, "OutputMemStats"sv, "OutputArchiveProfile"sv, "TestCode"sv,
@@ -230,7 +255,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.5 loaded");
+	REX::INFO("PickpocketPlus 0.6 loaded");
 	PPXP::Install();
 	return true;
 }
