@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.4
+// PickpocketPlus (OBSE64 plugin) — version 0.5
+// v0.5: worn-gear stealing (test build): PPStripTarget <maxDistance> unequips the nearest NPC's worn items,
+//       PPRestoreTarget re-equips whatever is left. All console commands are listed in the log once.
 // v0.4: adds the XP straight to the player's Sneak experience (the game's UseSkill calls did nothing / crashed).
 //       If that crosses the level threshold, the game levels Sneak up on its next own Sneak XP gain
 //       (e.g. when you close the steal menu).
@@ -62,43 +64,173 @@ namespace PPXP
 		return true;
 	}
 
-	void Install()
-	{
-		// unused debug commands, tried in order; the first one found is replaced
-		constexpr std::array candidates{
-			"OutputMemContexts"sv,
-			"OutputMemStats"sv,
-			"OutputArchiveProfile"sv,
-			"TestCode"sv
-		};
+	// ---------------- worn gear ----------------
+	RE::TESFormID                     g_targetID = 0;
+	std::vector<RE::TESBoundObject*>  g_stripped;
 
-		for (const auto name : candidates) {
-			if (auto cmd = RE::SCRIPT_FUNCTION::LocateConsoleCommand(name)) {
-				REX::INFO("replacing unused console command '{}' with PPAddSneakXP", name);
-				cmd->functionName = "PPAddSneakXP";
-				cmd->shortName = "ppxp";
-				cmd->helpString = "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)";
-				cmd->referenceFunction = false;
-				cmd->SetParameters(g_params);
-				cmd->executeFunction = &Execute;
-				cmd->editorFilter = false;
-				return;
+	RE::SCRIPT_PARAMETER g_distParams[] = {
+		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true }
+	};
+
+	RE::Actor* FindNearestNPC(float a_maxDist)
+	{
+		auto player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !player->parentCell) {
+			return nullptr;
+		}
+		const auto& p = player->data.location;
+		RE::Actor* best = nullptr;
+		float      bestDist = a_maxDist;
+		for (auto ref : player->parentCell->listReferences) {
+			if (!ref || ref == player || !ref->Is(RE::FormType::ActorCharacter)) {
+				continue;
+			}
+			const auto& l = ref->data.location;
+			const float dx = l.x - p.x, dy = l.y - p.y, dz = l.z - p.z;
+			const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
+			if (d <= bestDist) {
+				best = static_cast<RE::Actor*>(ref);
+				bestDist = d;
+			}
+		}
+		if (best) {
+			REX::INFO("nearest NPC: form {:08X} at distance {:.0f}", best->formID, bestDist);
+		}
+		return best;
+	}
+
+	bool ExecuteStrip(
+		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
+		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
+	{
+		a_result = 0.0;
+		float maxDist = 300.0f;
+		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &maxDist);
+		if (maxDist <= 0.0f) {
+			maxDist = 300.0f;
+		}
+
+		auto npc = FindNearestNPC(maxDist);
+		if (!npc) {
+			REX::INFO("PPStripTarget: no NPC within {:.0f}", maxDist);
+			return true;
+		}
+		auto xChanges = npc->extra.GetExtraData<RE::ExtraContainerChanges>();
+		if (!xChanges || !xChanges->changes || !xChanges->changes->list) {
+			REX::INFO("PPStripTarget: NPC has no inventory changes");
+			return true;
+		}
+
+		// collect first, unequip after (don't change the list while walking it)
+		std::vector<std::pair<RE::TESBoundObject*, RE::ExtraDataList*>> worn;
+		for (auto change : *xChanges->changes->list) {
+			if (!change || !change->object || !change->extraData) {
+				continue;
+			}
+			for (auto xList : *change->extraData) {
+				if (xList && (xList->GetExtraData(RE::EXTRA_DATA_TYPE::Worn) || xList->GetExtraData(RE::EXTRA_DATA_TYPE::WornLeft))) {
+					worn.emplace_back(change->object, xList);
+				}
 			}
 		}
 
-		REX::ERROR("no free console command found - listing all of them:");
+		g_targetID = npc->formID;
+		g_stripped.clear();
+		for (auto& [object, xList] : worn) {
+			const bool ok = npc->UnequipObject(object, 1, xList, true);
+			REX::INFO("  unequip {:08X}: {}", object->formID, ok ? "ok" : "failed");
+			g_stripped.push_back(object);
+		}
+		REX::INFO("PPStripTarget: {} worn item(s) unequipped on {:08X}", g_stripped.size(), g_targetID);
+		a_result = static_cast<double>(g_stripped.size());
+		return true;
+	}
+
+	bool ExecuteRestore(
+		const RE::SCRIPT_PARAMETER*, const char*, RE::TESObjectREFR*, RE::TESObjectREFR*, RE::Script*, RE::ScriptLocals*, double& a_result, std::uint32_t&)
+	{
+		a_result = 0.0;
+		if (!g_targetID || g_stripped.empty()) {
+			return true;
+		}
+		auto form = RE::TESForm::LookupByID(g_targetID);
+		auto npc = (form && form->Is(RE::FormType::ActorCharacter)) ? static_cast<RE::Actor*>(form) : nullptr;
+		if (!npc) {
+			REX::INFO("PPRestoreTarget: NPC {:08X} not found", g_targetID);
+			g_stripped.clear();
+			g_targetID = 0;
+			return true;
+		}
+		int restored = 0;
+		for (auto object : g_stripped) {
+			if (npc->GetItemCountInContainer(object) > 0) {
+				npc->EquipObject(object, 1, nullptr);
+				++restored;
+			} else {
+				REX::INFO("  {:08X} is gone (stolen)", object->formID);
+			}
+		}
+		REX::INFO("PPRestoreTarget: {} item(s) re-equipped on {:08X}", restored, g_targetID);
+		a_result = restored;
+		g_stripped.clear();
+		g_targetID = 0;
+		return true;
+	}
+
+	// ---------------- console command takeover ----------------
+	template <std::uint16_t N>
+	bool Hijack(std::string_view a_victim, const char* a_name, const char* a_short, const char* a_help,
+		RE::SCRIPT_PARAMETER (&a_params)[N], RE::SCRIPT_FUNCTION::Execute_t* a_fn)
+	{
+		auto cmd = RE::SCRIPT_FUNCTION::LocateConsoleCommand(a_victim);
+		if (!cmd) {
+			return false;
+		}
+		REX::INFO("replacing unused console command '{}' with {}", a_victim, a_name);
+		cmd->functionName = a_name;
+		cmd->shortName = a_short;
+		cmd->helpString = a_help;
+		cmd->referenceFunction = false;
+		cmd->SetParameters(a_params);
+		cmd->executeFunction = a_fn;
+		cmd->editorFilter = false;
+		return true;
+	}
+
+	void Install()
+	{
+		REX::INFO("console commands in this game version:");
 		for (auto& cmd : RE::SCRIPT_FUNCTION::GetConsoleFunctions()) {
 			if (cmd.functionName) {
 				REX::INFO("  {}", cmd.functionName);
 			}
 		}
+
+		// unused debug commands we may take over, in order
+		constexpr std::array victims{
+			"OutputMemContexts"sv, "OutputMemStats"sv, "OutputArchiveProfile"sv, "TestCode"sv,
+			"OutputLocalMapPictures"sv, "TestSeenData"sv
+		};
+		std::size_t next = 0;
+		auto take = [&](const char* a_name, const char* a_short, const char* a_help, auto& a_params, RE::SCRIPT_FUNCTION::Execute_t* a_fn) {
+			while (next < victims.size()) {
+				if (Hijack(victims[next++], a_name, a_short, a_help, a_params, a_fn)) {
+					return;
+				}
+			}
+			REX::ERROR("no free console command left for {}", a_name);
+		};
+
+		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_params, &Execute);
+		take("PPStripTarget", "ppstrip", "PickpocketPlus: unequips the nearest NPC's worn items (PPStripTarget <maxDistance>)", g_distParams, &ExecuteStrip);
+		take("PPRestoreTarget", "pprestore", "PickpocketPlus: re-equips what PPStripTarget took off", g_distParams, &ExecuteRestore);
 	}
 }
 
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.4 loaded");
+	REX::INFO("PickpocketPlus 0.5 loaded");
 	PPXP::Install();
 	return true;
 }
