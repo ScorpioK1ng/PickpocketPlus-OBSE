@@ -1,0 +1,37 @@
+# PickpocketPlus (OBSE64 plugin) — build workflow, version 0.1
+# Builds PickpocketPlus.dll on every push. Download it from the run's "Artifacts" section.
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: get CommonLibOB64
+        shell: pwsh
+        run: git clone --recurse-submodules --shallow-submodules --depth 1 https://github.com/libxse/commonlibob64 lib/commonlibob64
+
+      - name: setup xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: config
+        run: xmake config -y -p windows -a x64 -m releasedbg
+
+      - name: build
+        run: xmake build -y -vD
+
+      - name: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: PickpocketPlus-OBSE
+          path: |
+            build/windows/x64/releasedbg/*.dll
+            build/windows/x64/releasedbg/*.pdb
