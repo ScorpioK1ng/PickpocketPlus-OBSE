@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.6
+// PickpocketPlus (OBSE64 plugin) — version 0.7
+// v0.7: writes the stripped NPC's reference ID to PickpocketPlus_target.txt (game folder) so the UE4SS mod
+//       can address them directly ("<id>.additem ...") to refresh the steal menu.
 // v0.6: target = the NPC you activated (falls back to the nearest NPC); the stripped NPC becomes the console's
 //       selected reference, so the UE4SS mod can refresh the steal menu with a quick additem/removeitem.
 // v0.5: worn-gear stealing (test build): PPStripTarget <maxDistance> unequips the nearest NPC's worn items,
@@ -70,6 +72,25 @@ namespace PPXP
 	RE::TESFormID                     g_targetID = 0;
 	std::vector<RE::TESBoundObject*>  g_stripped;
 	RE::TESObjectREFR*                g_oldPick = nullptr;
+
+	// the UE4SS mod reads this right after PPStripTarget (same working folder, same process)
+	void WriteTargetFile(RE::TESFormID a_id)
+	{
+		std::ofstream file("PickpocketPlus_target.txt", std::ios::trunc);
+		if (!file) {
+			REX::WARN("could not write PickpocketPlus_target.txt");
+			return;
+		}
+		if (a_id) {
+			file << std::format("{:08X}", a_id);
+		}
+		static bool logged = false;
+		if (!logged) {
+			logged = true;
+			std::error_code ec;
+			REX::INFO("target file: {}", std::filesystem::absolute("PickpocketPlus_target.txt", ec).string());
+		}
+	}
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
@@ -170,6 +191,7 @@ namespace PPXP
 			g_oldPick = im->pickRef;
 			im->pickRef = npc;
 		}
+		WriteTargetFile(g_targetID);
 		a_result = static_cast<double>(g_stripped.size());
 		return true;
 	}
@@ -203,6 +225,7 @@ namespace PPXP
 			im->pickRef = g_oldPick;
 		}
 		g_oldPick = nullptr;
+		WriteTargetFile(0);
 		a_result = restored;
 		g_stripped.clear();
 		g_targetID = 0;
@@ -255,7 +278,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.6 loaded");
+	REX::INFO("PickpocketPlus 0.7 loaded");
 	PPXP::Install();
 	return true;
 }
