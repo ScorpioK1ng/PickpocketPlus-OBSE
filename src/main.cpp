@@ -1,4 +1,5 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.2
+// PickpocketPlus (OBSE64 plugin) — version 0.3
+// v0.3: build fix — the raw-usage UseSkill is called through Actor (PlayerCharacter hides that overload).
 // v0.2: logs Sneak XP before/after; if the pickpocket-action call changes nothing, falls back to the
 //       raw-usage UseSkill call. "PPAddSneakXP 0" just logs the current Sneak XP.
 //
@@ -63,7 +64,7 @@ namespace PPXP
 
 		// try 2: raw usage call, only if try 1 changed nothing
 		if (after1 == before) {
-			player->UseSkill(avIndex, amount, std::addressof(skill));
+			static_cast<RE::Actor*>(player)->UseSkill(avIndex, amount, std::addressof(skill));
 			const float after2 = player->skillUsage[slot];
 			REX::INFO("try 2 (raw usage call): Sneak XP {:.3f} -> {:.3f}", after1, after2);
 		}
@@ -108,7 +109,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.2 loaded");
+	REX::INFO("PickpocketPlus 0.3 loaded");
 	PPXP::Install();
 	return true;
 }
