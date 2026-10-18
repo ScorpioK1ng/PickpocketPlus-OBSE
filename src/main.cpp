@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.7
+// PickpocketPlus (OBSE64 plugin) — version 0.8
+// v0.8: PPStripTarget <maxDistance> <skipQuestAndScripted>: quest and scripted items stay on the NPC
+//       (default 1). Removed the console-selection and target-file experiments (the list can't be refreshed).
 // v0.7: writes the stripped NPC's reference ID to PickpocketPlus_target.txt (game folder) so the UE4SS mod
 //       can address them directly ("<id>.additem ...") to refresh the steal menu.
 // v0.6: target = the NPC you activated (falls back to the nearest NPC); the stripped NPC becomes the console's
@@ -71,26 +73,6 @@ namespace PPXP
 	// ---------------- worn gear ----------------
 	RE::TESFormID                     g_targetID = 0;
 	std::vector<RE::TESBoundObject*>  g_stripped;
-	RE::TESObjectREFR*                g_oldPick = nullptr;
-
-	// the UE4SS mod reads this right after PPStripTarget (same working folder, same process)
-	void WriteTargetFile(RE::TESFormID a_id)
-	{
-		std::ofstream file("PickpocketPlus_target.txt", std::ios::trunc);
-		if (!file) {
-			REX::WARN("could not write PickpocketPlus_target.txt");
-			return;
-		}
-		if (a_id) {
-			file << std::format("{:08X}", a_id);
-		}
-		static bool logged = false;
-		if (!logged) {
-			logged = true;
-			std::error_code ec;
-			REX::INFO("target file: {}", std::filesystem::absolute("PickpocketPlus_target.txt", ec).string());
-		}
-	}
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
@@ -102,6 +84,22 @@ namespace PPXP
 	RE::SCRIPT_PARAMETER g_distParams[] = {
 		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true }
 	};
+	RE::SCRIPT_PARAMETER g_stripParams[] = {
+		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
+		{ "skipQuestAndScripted", RE::SCRIPT_PARAM_TYPE::kInteger, true }
+	};
+
+	// quest items and items with a script attached stay on the NPC (stealing them can break quests)
+	bool IsProtected(RE::TESBoundObject* a_object)
+	{
+		if (a_object->formFlags & RE::TESForm::RecordFlags::kQuestItem) {
+			return true;
+		}
+		if (auto scriptable = RE::oblivion_cast<RE::TESScriptableForm*>(a_object); scriptable && scriptable->formScript) {
+			return true;
+		}
+		return false;
+	}
 
 	RE::Actor* FindNearestNPC(float a_maxDist)
 	{
@@ -135,8 +133,9 @@ namespace PPXP
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
 		a_result = 0.0;
-		float maxDist = 300.0f;
-		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &maxDist);
+		float        maxDist = 300.0f;
+		std::int32_t skipProtected = 1;
+		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &maxDist, &skipProtected);
 		if (maxDist <= 0.0f) {
 			maxDist = 300.0f;
 		}
@@ -172,6 +171,10 @@ namespace PPXP
 			}
 			for (auto xList : *change->extraData) {
 				if (xList && (xList->GetExtraData(RE::EXTRA_DATA_TYPE::Worn) || xList->GetExtraData(RE::EXTRA_DATA_TYPE::WornLeft))) {
+					if (skipProtected && IsProtected(change->object)) {
+						REX::INFO("  {:08X} is a quest/scripted item - left on", change->object->formID);
+						continue;
+					}
 					worn.emplace_back(change->object, xList);
 				}
 			}
@@ -185,13 +188,6 @@ namespace PPXP
 			g_stripped.push_back(object);
 		}
 		REX::INFO("PPStripTarget: {} worn item(s) unequipped on {:08X}", g_stripped.size(), g_targetID);
-
-		// make the NPC the console's selected reference, so "additem"/"removeitem" from the UE4SS mod hit them
-		if (im) {
-			g_oldPick = im->pickRef;
-			im->pickRef = npc;
-		}
-		WriteTargetFile(g_targetID);
 		a_result = static_cast<double>(g_stripped.size());
 		return true;
 	}
@@ -221,11 +217,7 @@ namespace PPXP
 			}
 		}
 		REX::INFO("PPRestoreTarget: {} item(s) re-equipped on {:08X}", restored, g_targetID);
-		if (auto im = RE::InterfaceManager::GetInstance(false, false); im && im->pickRef == npc) {
-			im->pickRef = g_oldPick;
-		}
-		g_oldPick = nullptr;
-		WriteTargetFile(0);
+
 		a_result = restored;
 		g_stripped.clear();
 		g_targetID = 0;
@@ -270,7 +262,7 @@ namespace PPXP
 		};
 
 		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_params, &Execute);
-		take("PPStripTarget", "ppstrip", "PickpocketPlus: unequips the nearest NPC's worn items (PPStripTarget <maxDistance>)", g_distParams, &ExecuteStrip);
+		take("PPStripTarget", "ppstrip", "PickpocketPlus: unequips the NPC's worn items (PPStripTarget <maxDistance> <skipQuestAndScripted>)", g_stripParams, &ExecuteStrip);
 		take("PPRestoreTarget", "pprestore", "PickpocketPlus: re-equips what PPStripTarget took off", g_distParams, &ExecuteRestore);
 	}
 }
@@ -278,7 +270,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.7 loaded");
+	REX::INFO("PickpocketPlus 0.8 loaded");
 	PPXP::Install();
 	return true;
 }
