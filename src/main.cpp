@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.17
+// PickpocketPlus (OBSE64 plugin) — version 0.18
+// v0.18: the trace also records the start and end of every PickpocketPlus console command (the crash is in the
+//        game's console handling - this shows whether one of ours was running at that moment).
 // v0.17: targets the NPC in FRONT of you (within a 50° cone), the nearest one only as a fallback (crowded
 //        taverns picked the wrong NPC); writes PickpocketPlus_trace.txt right before and after every add /
 //        remove / equip call, so after a crash the last line shows exactly which call crashed.
@@ -34,6 +36,16 @@ namespace PPXP
 	constexpr std::int32_t kSneak = 31;       // actor value index of Sneak
 	constexpr std::int32_t kFirstSkill = 12;  // TESDataHandler::skill[0] is Armorer (12)
 
+	// flushed line-by-line, so it survives a crash (the normal log may lose its last lines)
+	void Trace(const std::string& a_line)
+	{
+		static std::ofstream file("PickpocketPlus_trace.txt", std::ios::trunc);
+		if (file) {
+			const auto now = std::chrono::system_clock::now();
+			file << std::format("{:%H:%M:%S} {}", std::chrono::floor<std::chrono::milliseconds>(now), a_line) << std::endl;
+		}
+	}
+
 	// ---------------- Sneak XP ----------------
 	RE::SCRIPT_PARAMETER g_xpParams[] = {
 		{ "amount", RE::SCRIPT_PARAM_TYPE::kFloat, false }
@@ -43,6 +55,8 @@ namespace PPXP
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
+		Trace("cmd PPAddSneakXP start");
+		struct TraceEnd { ~TraceEnd() { Trace("cmd PPAddSneakXP end"); } } traceEnd;
 		a_result = 0.0;
 		float amount = 0.0f;
 		if (!RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &amount)) {
@@ -84,16 +98,6 @@ namespace PPXP
 	RE::SCRIPT_PARAMETER g_cleanupParams[] = {
 		{ "forgetOnly", RE::SCRIPT_PARAM_TYPE::kInt, true }
 	};
-
-	// flushed line-by-line, so it survives a crash (the normal log may lose its last lines)
-	void Trace(const std::string& a_line)
-	{
-		static std::ofstream file("PickpocketPlus_trace.txt", std::ios::trunc);
-		if (file) {
-			const auto now = std::chrono::system_clock::now();
-			file << std::format("{:%H:%M:%S} {}", std::chrono::floor<std::chrono::milliseconds>(now), a_line) << std::endl;
-		}
-	}
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
@@ -308,6 +312,8 @@ namespace PPXP
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
+		Trace("cmd PPPrepareTarget start");
+		struct TraceEnd { ~TraceEnd() { Trace("cmd PPPrepareTarget end"); } } traceEnd;
 		a_result = 0.0;
 		float        maxDist = 300.0f;
 		std::int32_t skipProtected = 1;
@@ -405,6 +411,8 @@ namespace PPXP
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
+		Trace("cmd PPCleanupTarget start");
+		struct TraceEnd { ~TraceEnd() { Trace("cmd PPCleanupTarget end"); } } traceEnd;
 		a_result = 0.0;
 		std::int32_t forgetOnly = 0;
 		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &forgetOnly);
@@ -468,7 +476,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.17 loaded");
+	REX::INFO("PickpocketPlus 0.18 loaded");
 	PPXP::Install();
 	return true;
 }
