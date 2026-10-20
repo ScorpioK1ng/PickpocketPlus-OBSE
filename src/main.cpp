@@ -1,4 +1,7 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.19
+// PickpocketPlus (OBSE64 plugin) — version 0.20
+// v0.20: self-repair after loading a save: every NPC that got copies is remembered in PickpocketPlus_ledger.txt
+//        (NPC, item, count before the copy). "PPCleanupTarget 2" (sent after each load) removes any extra copies
+//        a save captured, so a save made with copies active heals itself on load.
 // v0.19: switching to another NPC while sneaking cleans up the old one and prepares the new one in the same
 //        call (the crashes turned out to be in the console, not in adding/removing items).
 // v0.18: the trace also records the start and end of every PickpocketPlus console command (the crash is in the
@@ -267,6 +270,70 @@ namespace PPXP
 		}
 	}
 
+	// ---------------- ledger: what we copied, so saves that captured copies can be repaired ----------------
+	struct LedgerEntry
+	{
+		RE::TESFormID npc;
+		RE::TESFormID object;
+		std::int32_t  baseline;  // NPC's count of the item before the copy was added
+	};
+	constexpr std::size_t kLedgerMax = 60;
+
+	std::vector<LedgerEntry> LoadLedger()
+	{
+		std::vector<LedgerEntry> list;
+		std::ifstream            file("PickpocketPlus_ledger.txt");
+		LedgerEntry              e{};
+		while (file >> std::hex >> e.npc >> e.object >> std::dec >> e.baseline) {
+			list.push_back(e);
+		}
+		return list;
+	}
+
+	void SaveLedger(const std::vector<LedgerEntry>& a_list)
+	{
+		std::ofstream file("PickpocketPlus_ledger.txt", std::ios::trunc);
+		for (auto& e : a_list) {
+			file << std::format("{:08X} {:08X} {}\n", e.npc, e.object, e.baseline);
+		}
+	}
+
+	void RememberCopy(RE::TESFormID a_npc, RE::TESFormID a_object, std::int32_t a_baseline)
+	{
+		auto list = LoadLedger();
+		std::erase_if(list, [&](const LedgerEntry& e) { return e.npc == a_npc && e.object == a_object; });
+		list.push_back({ a_npc, a_object, a_baseline });
+		if (list.size() > kLedgerMax) {
+			list.erase(list.begin(), list.begin() + (list.size() - kLedgerMax));
+		}
+		SaveLedger(list);
+	}
+
+	// after a load: any NPC holding more of an item than before we ever copied it gets the extras removed
+	void RepairAfterLoad()
+	{
+		int repaired = 0;
+		for (auto& e : LoadLedger()) {
+			auto npc = LookupNPC(e.npc);
+			auto form = RE::TESForm::LookupByID(e.object);
+			if (!npc || !form || !npc->parentCell) {
+				continue;  // not loaded right now: checked again after the next load
+			}
+			auto object = static_cast<RE::TESBoundObject*>(form);
+			const std::int32_t now = npc->GetItemCountInContainer(object);
+			for (std::int32_t extra = now - e.baseline; extra > 0; --extra) {
+				Trace(std::format("repair: remove saved copy {:08X} from {:08X}", e.object, e.npc));
+				npc->RemoveItem(object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
+				Trace("  done");
+				++repaired;
+			}
+			if (now > e.baseline && !WornListOf(npc, object) && npc->GetItemCountInContainer(object) > 0) {
+				npc->EquipObject(object, 1, nullptr);
+			}
+		}
+		REX::INFO("PPCleanupTarget: repair after load - {} saved copies removed", repaired);
+	}
+
 	void Cleanup()
 	{
 		auto npc = LookupNPC(g_prepID);
@@ -397,6 +464,7 @@ namespace PPXP
 		g_prepTime = std::chrono::steady_clock::now();
 		g_copies.clear();
 		for (auto object : worn) {
+			RememberCopy(npc->formID, object->formID, npc->GetItemCountInContainer(object));
 			Trace(std::format("add copy {:08X} to {:08X}", object->formID, npc->formID));
 			npc->AddObjectToContainer(object, nullptr, 1);
 			Trace("  done");
@@ -417,17 +485,22 @@ namespace PPXP
 		a_result = 0.0;
 		std::int32_t forgetOnly = 0;
 		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &forgetOnly);
-		if (!g_prepID) {
-			return true;
-		}
 		if (forgetOnly) {
-			REX::INFO("PPCleanupTarget: forgetting {:08X} after a load (inventory untouched)", g_prepID);
+			// 1 = after a load: forget the old state; 2 = also repair saves that captured copies
+			if (g_prepID) {
+				REX::INFO("PPCleanupTarget: forgetting {:08X} after a load (inventory untouched)", g_prepID);
+			}
 			g_copies.clear();
 			g_prepID = 0;
 			WriteWornFile(g_copies);
+			if (forgetOnly == 2) {
+				RepairAfterLoad();
+			}
 			return true;
 		}
-		Cleanup();
+		if (g_prepID) {
+			Cleanup();
+		}
 		return true;
 	}
 
@@ -469,7 +542,7 @@ namespace PPXP
 
 		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_xpParams, &ExecuteAddXP);
 		take("PPPrepareTarget", "ppprep", "PickpocketPlus: copies the aimed NPC's worn items (PPPrepareTarget <maxDistance> <skipProtected>)", g_prepParams, &ExecutePrepare);
-		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes leftover worn-item copies (PPCleanupTarget <forgetOnly>)", g_cleanupParams, &ExecuteCleanup);
+		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes worn-item copies (PPCleanupTarget <0 normal | 1 forget | 2 forget + repair after load>)", g_cleanupParams, &ExecuteCleanup);
 		WriteWornFile(g_copies);  // start with an empty file
 	}
 }
@@ -477,7 +550,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.19 loaded");
+	REX::INFO("PickpocketPlus 0.20 loaded");
 	PPXP::Install();
 	return true;
 }
