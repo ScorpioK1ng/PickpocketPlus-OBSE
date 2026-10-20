@@ -1,4 +1,7 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.16
+// PickpocketPlus (OBSE64 plugin) — version 0.17
+// v0.17: targets the NPC in FRONT of you (within a 50° cone), the nearest one only as a fallback (crowded
+//        taverns picked the wrong NPC); writes PickpocketPlus_trace.txt right before and after every add /
+//        remove / equip call, so after a crash the last line shows exactly which call crashed.
 // v0.16: crash safety: every crash so far happened while changing an NPC's inventory shortly after a previous
 //        change (the NPC's AI still re-checking its gear). Now: copies are not added to an NPC within 5 s of
 //        their last cleanup, and an AI-removed piece is put back only after 2 s.
@@ -82,6 +85,16 @@ namespace PPXP
 		{ "forgetOnly", RE::SCRIPT_PARAM_TYPE::kInt, true }
 	};
 
+	// flushed line-by-line, so it survives a crash (the normal log may lose its last lines)
+	void Trace(const std::string& a_line)
+	{
+		static std::ofstream file("PickpocketPlus_trace.txt", std::ios::trunc);
+		if (file) {
+			const auto now = std::chrono::system_clock::now();
+			file << std::format("{:%H:%M:%S} {}", std::chrono::floor<std::chrono::milliseconds>(now), a_line) << std::endl;
+		}
+	}
+
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
 		if (!a_ref || !a_ref->Is(RE::FormType::ActorCharacter) || a_ref == RE::PlayerCharacter::GetSingleton()) {
@@ -113,6 +126,43 @@ namespace PPXP
 		const auto& l = a_ref->data.location;
 		const float dx = l.x - p.x, dy = l.y - p.y, dz = l.z - p.z;
 		return std::sqrt(dx * dx + dy * dy + dz * dz);
+	}
+
+	// the NPC you're facing: smallest angle to your view direction (within 50 degrees), nearest as fallback
+	RE::Actor* FindTargetNPC(float a_maxDist)
+	{
+		auto player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !player->parentCell) {
+			return nullptr;
+		}
+		const auto& p = player->data.location;
+		const float yaw = player->data.angle.z;
+		const float fx = std::sin(yaw), fy = std::cos(yaw);
+		RE::Actor* best = nullptr;
+		float      bestAngle = 50.0f;
+		for (auto ref : player->parentCell->listReferences) {
+			auto npc = AsNPC(ref);
+			if (!npc) {
+				continue;
+			}
+			const float d = DistanceToPlayer(npc);
+			if (d > a_maxDist || d < 1.0f) {
+				continue;
+			}
+			const float dx = npc->data.location.x - p.x, dy = npc->data.location.y - p.y;
+			const float len = std::sqrt(dx * dx + dy * dy);
+			if (len < 1.0f) {
+				continue;
+			}
+			float cosA = (dx * fx + dy * fy) / len;
+			cosA = std::clamp(cosA, -1.0f, 1.0f);
+			const float angle = std::acos(cosA) * 57.2958f;
+			if (angle < bestAngle) {
+				best = npc;
+				bestAngle = angle;
+			}
+		}
+		return best;
 	}
 
 	RE::Actor* FindNearestNPC(float a_maxDist)
@@ -220,18 +270,26 @@ namespace PPXP
 				const std::int32_t now = npc->GetItemCountInContainer(c.object);
 				if (now >= c.countWithCopy) {
 					// copy still there: remove it, and make sure the real piece is still worn
+					Trace(std::format("remove copy {:08X} from {:08X}", c.object->formID, g_prepID));
 					npc->RemoveItem(c.object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
+					Trace("  done");
 					++removedCopies;
 					if (!WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
+						Trace(std::format("re-equip {:08X} on {:08X}", c.object->formID, g_prepID));
 						npc->EquipObject(c.object, 1, nullptr);
+						Trace("  done");
 					}
 				} else {
 					// the copy was stolen: the real worn piece goes too
 					if (auto worn = WornListOf(npc, c.object)) {
+						Trace(std::format("unequip stolen {:08X} on {:08X}", c.object->formID, g_prepID));
 						npc->UnequipObject(c.object, 1, worn, true);
+						Trace("  done");
 					}
 					if (npc->GetItemCountInContainer(c.object) > 0) {
+						Trace(std::format("remove stolen {:08X} from {:08X}", c.object->formID, g_prepID));
 						npc->RemoveItem(c.object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
+						Trace("  done");
 					}
 					++takenWorn;
 					REX::INFO("  {:08X} was stolen - real worn piece removed", c.object->formID);
@@ -264,6 +322,9 @@ namespace PPXP
 			npc = nullptr;
 		}
 		if (!npc) {
+			npc = FindTargetNPC(maxDist);
+		}
+		if (!npc) {
 			npc = FindNearestNPC(maxDist);
 		}
 		if (!npc) {
@@ -284,7 +345,9 @@ namespace PPXP
 			for (auto& c : g_copies) {
 				if (c.redressTries < 1 && !WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
 					++c.redressTries;
+					Trace(std::format("put back {:08X} on {:08X}", c.object->formID, npc->formID));
 					npc->EquipObject(c.object, 1, nullptr);
+					Trace("  done");
 					REX::INFO("  {:08X} was taken off by the AI - put back on", c.object->formID);
 				}
 			}
@@ -327,7 +390,9 @@ namespace PPXP
 		g_prepTime = std::chrono::steady_clock::now();
 		g_copies.clear();
 		for (auto object : worn) {
+			Trace(std::format("add copy {:08X} to {:08X}", object->formID, npc->formID));
 			npc->AddObjectToContainer(object, nullptr, 1);
+			Trace("  done");
 			g_copies.push_back({ object, npc->GetItemCountInContainer(object) });
 		}
 		WriteWornFile(g_copies);
@@ -403,7 +468,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.16 loaded");
+	REX::INFO("PickpocketPlus 0.17 loaded");
 	PPXP::Install();
 	return true;
 }
