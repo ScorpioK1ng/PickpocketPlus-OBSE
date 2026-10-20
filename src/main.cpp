@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.18
+// PickpocketPlus (OBSE64 plugin) — version 0.19
+// v0.19: switching to another NPC while sneaking cleans up the old one and prepares the new one in the same
+//        call (the crashes turned out to be in the console, not in adding/removing items).
 // v0.18: the trace also records the start and end of every PickpocketPlus console command (the crash is in the
 //        game's console handling - this shows whether one of ours was running at that moment).
 // v0.17: targets the NPC in FRONT of you (within a 50° cone), the nearest one only as a fallback (crowded
@@ -360,8 +362,7 @@ namespace PPXP
 			return true;
 		}
 		if (g_prepID) {
-			Cleanup();
-			return true;  // never clean one NPC and fill another in the same moment
+			Cleanup();  // switched to another NPC: the old one gets their real gear back first
 		}
 		if (npc->formID == g_lastCleanID && std::chrono::steady_clock::now() - g_lastCleanTime < std::chrono::seconds(5)) {
 			return true;  // this NPC's AI may still be re-checking its gear after the last cleanup
@@ -476,7 +477,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.18 loaded");
+	REX::INFO("PickpocketPlus 0.19 loaded");
 	PPXP::Install();
 	return true;
 }
