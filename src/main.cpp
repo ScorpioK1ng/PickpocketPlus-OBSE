@@ -1,4 +1,7 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.9
+// PickpocketPlus (OBSE64 plugin) — version 0.10
+// v0.10: target = crosshair NPC if the game reports one, otherwise the nearest NPC in reach (the crosshair
+//        target turned out to be empty in the Remaster); dead/unconscious NPCs are never touched (no duplicate
+//        loot on corpses).
 // v0.9: worn gear via COPIES (the NPC stays dressed): while you sneak and aim at an NPC, PPPrepareTarget adds an
 //       unequipped copy of each worn item, so the steal menu lists them from the start. PPCleanupTarget removes
 //       the copies you left - or the real worn piece, if you stole its copy. Worn item names go to
@@ -65,9 +68,11 @@ namespace PPXP
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
-		return (a_ref && a_ref->Is(RE::FormType::ActorCharacter) && a_ref != RE::PlayerCharacter::GetSingleton()) ?
-		           static_cast<RE::Actor*>(a_ref) :
-		           nullptr;
+		if (!a_ref || !a_ref->Is(RE::FormType::ActorCharacter) || a_ref == RE::PlayerCharacter::GetSingleton()) {
+			return nullptr;
+		}
+		auto actor = static_cast<RE::Actor*>(a_ref);
+		return actor->lifeState == RE::ACTOR_LIFE_STATE::kAlive ? actor : nullptr;
 	}
 
 	RE::Actor* LookupNPC(RE::TESFormID a_id)
@@ -92,6 +97,26 @@ namespace PPXP
 		const auto& l = a_ref->data.location;
 		const float dx = l.x - p.x, dy = l.y - p.y, dz = l.z - p.z;
 		return std::sqrt(dx * dx + dy * dy + dz * dz);
+	}
+
+	RE::Actor* FindNearestNPC(float a_maxDist)
+	{
+		auto player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !player->parentCell) {
+			return nullptr;
+		}
+		RE::Actor* best = nullptr;
+		float      bestDist = a_maxDist;
+		for (auto ref : player->parentCell->listReferences) {
+			if (auto npc = AsNPC(ref)) {
+				const float d = DistanceToPlayer(npc);
+				if (d <= bestDist) {
+					best = npc;
+					bestDist = d;
+				}
+			}
+		}
+		return best;
 	}
 
 	// quest items and items with a script attached stay untouched (stealing them can break quests)
@@ -202,7 +227,10 @@ namespace PPXP
 			npc = nullptr;
 		}
 		if (!npc) {
-			// not aiming at anyone in reach: drop the prepared NPC once we've walked away from them
+			npc = FindNearestNPC(maxDist);
+		}
+		if (!npc) {
+			// nobody in reach: drop the prepared NPC once we've walked away from them
 			if (g_prepID) {
 				auto prepared = LookupNPC(g_prepID);
 				if (!prepared || DistanceToPlayer(prepared) > maxDist * 1.5f) {
@@ -311,7 +339,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.9 loaded");
+	REX::INFO("PickpocketPlus 0.10 loaded");
 	PPXP::Install();
 	return true;
 }
