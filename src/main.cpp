@@ -1,4 +1,7 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.15
+// PickpocketPlus (OBSE64 plugin) — version 0.16
+// v0.16: crash safety: every crash so far happened while changing an NPC's inventory shortly after a previous
+//        change (the NPC's AI still re-checking its gear). Now: copies are not added to an NPC within 5 s of
+//        their last cleanup, and an AI-removed piece is put back only after 2 s.
 // v0.15: a piece the AI took off (e.g. the shield) is put back after 0.5 s of settling instead of 2 s.
 // v0.14: "PPCleanupTarget 1" only forgets the prepared NPC without touching their inventory (used after a save
 //        is loaded: the reloaded NPC has no copies, so a normal cleanup would wrongly take real pieces).
@@ -68,6 +71,8 @@ namespace PPXP
 	RE::TESFormID                         g_prepID = 0;
 	std::vector<Copy>                     g_copies;
 	std::chrono::steady_clock::time_point g_prepTime{};
+	RE::TESFormID                         g_lastCleanID = 0;
+	std::chrono::steady_clock::time_point g_lastCleanTime{};
 
 	RE::SCRIPT_PARAMETER g_prepParams[] = {
 		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
@@ -234,6 +239,8 @@ namespace PPXP
 			}
 			REX::INFO("PPCleanupTarget: {:08X}: {} copies removed, {} worn pieces taken", g_prepID, removedCopies, takenWorn);
 		}
+		g_lastCleanID = g_prepID;
+		g_lastCleanTime = std::chrono::steady_clock::now();
 		g_copies.clear();
 		g_prepID = 0;
 		WriteWornFile(g_copies);
@@ -271,7 +278,7 @@ namespace PPXP
 		}
 		if (npc->formID == g_prepID) {
 			// already prepared: make sure the AI didn't take a real piece off (e.g. the shield)
-			if (std::chrono::steady_clock::now() - g_prepTime < std::chrono::milliseconds(500)) {
+			if (std::chrono::steady_clock::now() - g_prepTime < std::chrono::seconds(2)) {
 				return true;  // let the NPC settle first
 			}
 			for (auto& c : g_copies) {
@@ -285,6 +292,10 @@ namespace PPXP
 		}
 		if (g_prepID) {
 			Cleanup();
+			return true;  // never clean one NPC and fill another in the same moment
+		}
+		if (npc->formID == g_lastCleanID && std::chrono::steady_clock::now() - g_lastCleanTime < std::chrono::seconds(5)) {
+			return true;  // this NPC's AI may still be re-checking its gear after the last cleanup
 		}
 
 		auto changes = ChangesOf(npc);
@@ -392,7 +403,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.15 loaded");
+	REX::INFO("PickpocketPlus 0.16 loaded");
 	PPXP::Install();
 	return true;
 }

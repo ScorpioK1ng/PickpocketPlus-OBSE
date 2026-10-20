@@ -1,4 +1,4 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.15
+// PickpocketPlus (OBSE64 plugin) — version 0.16
 #pragma once
 
 #include <RE/Oblivion.h>
