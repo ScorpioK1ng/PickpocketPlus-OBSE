@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.10
+// PickpocketPlus (OBSE64 plugin) — version 0.11
+// v0.11: PickpocketPlus_worn.txt lines are "name|value|weight" (the UE4SS mod can match items by value and
+//        weight if the names differ from the menu's); each line is also logged.
 // v0.10: target = crosshair NPC if the game reports one, otherwise the nearest NPC in reach (the crosshair
 //        target turned out to be empty in the Remaster); dead/unconscious NPCs are never touched (no duplicate
 //        loot on corpses).
@@ -162,6 +164,17 @@ namespace PPXP
 	}
 
 	// names for the UE4SS mod (it marks these items in the steal list)
+	std::string NameOf(RE::TESBoundObject* a_object)
+	{
+		if (auto name = RE::TESFullName::GetFullName(a_object); name && *name) {
+			return name;
+		}
+		if (auto full = RE::oblivion_cast<RE::TESFullName*>(a_object); full && full->fullName.c_str()) {
+			return full->fullName.c_str();
+		}
+		return {};
+	}
+
 	void WriteWornFile(const std::vector<Copy>& a_copies)
 	{
 		std::ofstream file("PickpocketPlus_worn.txt", std::ios::trunc);
@@ -170,9 +183,17 @@ namespace PPXP
 			return;
 		}
 		for (auto& c : a_copies) {
-			if (auto name = RE::TESFullName::GetFullName(c.object); name && *name) {
-				file << name << "\n";
+			std::uint32_t value = 0;
+			float         weight = 0.0f;
+			if (auto v = RE::oblivion_cast<RE::TESValueForm*>(c.object)) {
+				value = v->value;
 			}
+			if (auto w = RE::oblivion_cast<RE::TESWeightForm*>(c.object)) {
+				weight = w->weight;
+			}
+			const auto line = std::format("{}|{}|{:.2f}", NameOf(c.object), value, weight);
+			file << line << "\n";
+			REX::INFO("  worn copy: {}", line);
 		}
 	}
 
@@ -339,7 +360,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.10 loaded");
+	REX::INFO("PickpocketPlus 0.11 loaded");
 	PPXP::Install();
 	return true;
 }
