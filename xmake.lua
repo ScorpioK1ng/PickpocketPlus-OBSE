@@ -1,10 +1,10 @@
--- PickpocketPlus (OBSE64 plugin) — version 0.10
+-- PickpocketPlus (OBSE64 plugin) — version 0.11
 -- Console commands for the PickpocketPlus UE4SS mod: bonus Sneak XP and worn-gear copies.
 
 includes("lib/commonlibob64")
 
 set_project("PickpocketPlus")
-set_version("0.10.0")
+set_version("0.11.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
