@@ -1,78 +1,67 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.8
-// v0.8: PPStripTarget <maxDistance> <skipQuestAndScripted>: quest and scripted items stay on the NPC
-//       (default 1). Removed the console-selection and target-file experiments (the list can't be refreshed).
-// v0.7: writes the stripped NPC's reference ID to PickpocketPlus_target.txt (game folder) so the UE4SS mod
-//       can address them directly ("<id>.additem ...") to refresh the steal menu.
-// v0.6: target = the NPC you activated (falls back to the nearest NPC); the stripped NPC becomes the console's
-//       selected reference, so the UE4SS mod can refresh the steal menu with a quick additem/removeitem.
-// v0.5: worn-gear stealing (test build): PPStripTarget <maxDistance> unequips the nearest NPC's worn items,
-//       PPRestoreTarget re-equips whatever is left. All console commands are listed in the log once.
-// v0.4: adds the XP straight to the player's Sneak experience (the game's UseSkill calls did nothing / crashed).
-//       If that crosses the level threshold, the game levels Sneak up on its next own Sneak XP gain
-//       (e.g. when you close the steal menu).
-// v0.3: build fix. v0.2: XP diagnostics. v0.1: first version.
+// PickpocketPlus (OBSE64 plugin) — version 0.9
+// v0.9: worn gear via COPIES (the NPC stays dressed): while you sneak and aim at an NPC, PPPrepareTarget adds an
+//       unequipped copy of each worn item, so the steal menu lists them from the start. PPCleanupTarget removes
+//       the copies you left - or the real worn piece, if you stole its copy. Worn item names go to
+//       PickpocketPlus_worn.txt for the UE4SS mod. The undress method (PPStripTarget/PPRestoreTarget) is gone.
+// v0.8: quest/scripted items stay on. v0.4-0.7: XP written straight to Sneak experience, strip experiments.
+// v0.1-0.3: first version, build fixes.
 //
-// Takes over one unused debug console command and turns it into:
-//     PPAddSneakXP <amount>        (short name: ppxp)
-// which adds <amount> Sneak XP, in the same units as the game's own pickpocket XP (2 per pickpocket).
-// "PPAddSneakXP 0" only logs the current Sneak XP. The PickpocketPlus UE4SS mod calls it after every steal.
+// Console commands (each takes over an unused debug command):
+//     PPAddSneakXP <amount>                          adds Sneak XP (game units: 2 per pickpocket)
+//     PPPrepareTarget <maxDistance> <skipProtected>  copies the crosshair NPC's worn items into their inventory
+//     PPCleanupTarget                                removes leftover copies / stolen worn pieces
 
 namespace PPXP
 {
 	constexpr std::int32_t kSneak = 31;       // actor value index of Sneak
 	constexpr std::int32_t kFirstSkill = 12;  // TESDataHandler::skill[0] is Armorer (12)
 
-	RE::SCRIPT_PARAMETER g_params[] = {
+	// ---------------- Sneak XP ----------------
+	RE::SCRIPT_PARAMETER g_xpParams[] = {
 		{ "amount", RE::SCRIPT_PARAM_TYPE::kFloat, false }
 	};
 
-	bool Execute(
-		const RE::SCRIPT_PARAMETER* a_parameters,
-		const char*                 a_compiledParams,
-		RE::TESObjectREFR*          a_refObject,
-		RE::TESObjectREFR*          a_container,
-		RE::Script*                 a_script,
-		RE::ScriptLocals*           a_scriptLocals,
-		double&                     a_result,
-		std::uint32_t&              a_offset)
+	bool ExecuteAddXP(
+		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
+		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
 		a_result = 0.0;
-
 		float amount = 0.0f;
 		if (!RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &amount)) {
-			REX::WARN("PPAddSneakXP: could not read the amount");
 			return true;
 		}
 		auto player = RE::PlayerCharacter::GetSingleton();
-		auto data = RE::TESDataHandler::GetSingleton();
-		if (!player || !data) {
-			REX::WARN("PPAddSneakXP: player or game data not ready");
+		if (!player) {
 			return true;
 		}
-
 		constexpr std::int32_t slot = kSneak - kFirstSkill;
-
 		const float before = player->skillUsage[slot];
 		const float needed = player->skillAdvancementUses[slot];
-		REX::INFO("Sneak XP now {:.3f} / {:.3f} needed for the next level", before, needed);
-		if (amount <= 0.0f) {
-			return true;
+		if (amount > 0.0f) {
+			player->skillUsage[slot] = before + amount;
 		}
-
-		player->skillUsage[slot] = before + amount;
-		const float after = player->skillUsage[slot];
-		REX::INFO("PPAddSneakXP: +{:.3f} -> Sneak XP {:.3f} / {:.3f}", amount, after, needed);
-		if (needed > 0.0f && after >= needed) {
-			REX::INFO("over the threshold: Sneak levels up on the game's next own Sneak XP gain");
-		}
-
+		REX::INFO("PPAddSneakXP: +{:.3f} -> Sneak XP {:.3f} / {:.3f}", amount, player->skillUsage[slot], needed);
 		a_result = amount;
 		return true;
 	}
 
-	// ---------------- worn gear ----------------
-	RE::TESFormID                     g_targetID = 0;
-	std::vector<RE::TESBoundObject*>  g_stripped;
+	// ---------------- worn-gear copies ----------------
+	struct Copy
+	{
+		RE::TESBoundObject* object;
+		std::int32_t        countWithCopy;  // NPC's count of this item right after the copy was added
+	};
+
+	RE::TESFormID     g_prepID = 0;
+	std::vector<Copy> g_copies;
+
+	RE::SCRIPT_PARAMETER g_prepParams[] = {
+		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
+		{ "skipProtected", RE::SCRIPT_PARAM_TYPE::kInt, true }
+	};
+	RE::SCRIPT_PARAMETER g_noParams[] = {
+		{ "unused", RE::SCRIPT_PARAM_TYPE::kInt, true }
+	};
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
@@ -81,15 +70,31 @@ namespace PPXP
 		           nullptr;
 	}
 
-	RE::SCRIPT_PARAMETER g_distParams[] = {
-		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true }
-	};
-	RE::SCRIPT_PARAMETER g_stripParams[] = {
-		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
-		{ "skipQuestAndScripted", RE::SCRIPT_PARAM_TYPE::kInt, true }
-	};
+	RE::Actor* LookupNPC(RE::TESFormID a_id)
+	{
+		if (!a_id) {
+			return nullptr;
+		}
+		auto form = RE::TESForm::LookupByID(a_id);
+		if (!form || !form->Is(RE::FormType::ActorCharacter)) {
+			return nullptr;
+		}
+		return static_cast<RE::Actor*>(form);
+	}
 
-	// quest items and items with a script attached stay on the NPC (stealing them can break quests)
+	float DistanceToPlayer(RE::TESObjectREFR* a_ref)
+	{
+		auto player = RE::PlayerCharacter::GetSingleton();
+		if (!player || !a_ref) {
+			return 1e9f;
+		}
+		const auto& p = player->data.location;
+		const auto& l = a_ref->data.location;
+		const float dx = l.x - p.x, dy = l.y - p.y, dz = l.z - p.z;
+		return std::sqrt(dx * dx + dy * dy + dz * dz);
+	}
+
+	// quest items and items with a script attached stay untouched (stealing them can break quests)
 	bool IsProtected(RE::TESBoundObject* a_object)
 	{
 		if (a_object->formFlags & RE::TESForm::RecordFlags::kQuestItem) {
@@ -101,34 +106,85 @@ namespace PPXP
 		return false;
 	}
 
-	RE::Actor* FindNearestNPC(float a_maxDist)
+	RE::InventoryChanges* ChangesOf(RE::Actor* a_npc)
 	{
-		auto player = RE::PlayerCharacter::GetSingleton();
-		if (!player || !player->parentCell) {
-			return nullptr;
-		}
-		const auto& p = player->data.location;
-		RE::Actor* best = nullptr;
-		float      bestDist = a_maxDist;
-		for (auto ref : player->parentCell->listReferences) {
-			if (!ref || ref == player || !ref->Is(RE::FormType::ActorCharacter)) {
-				continue;
-			}
-			const auto& l = ref->data.location;
-			const float dx = l.x - p.x, dy = l.y - p.y, dz = l.z - p.z;
-			const float d = std::sqrt(dx * dx + dy * dy + dz * dz);
-			if (d <= bestDist) {
-				best = static_cast<RE::Actor*>(ref);
-				bestDist = d;
-			}
-		}
-		if (best) {
-			REX::INFO("nearest NPC: form {:08X} at distance {:.0f}", best->formID, bestDist);
-		}
-		return best;
+		auto x = a_npc->extra.GetExtraData<RE::ExtraContainerChanges>();
+		return (x && x->changes && x->changes->list) ? x->changes : nullptr;
 	}
 
-	bool ExecuteStrip(
+	bool IsWornList(RE::ExtraDataList* a_xList)
+	{
+		return a_xList && (a_xList->GetExtraData(RE::EXTRA_DATA_TYPE::Worn) || a_xList->GetExtraData(RE::EXTRA_DATA_TYPE::WornLeft));
+	}
+
+	// the worn instance of an item on the NPC (nullptr if not worn)
+	RE::ExtraDataList* WornListOf(RE::Actor* a_npc, RE::TESBoundObject* a_object)
+	{
+		auto changes = ChangesOf(a_npc);
+		if (!changes) {
+			return nullptr;
+		}
+		for (auto change : *changes->list) {
+			if (change && change->object == a_object && change->extraData) {
+				for (auto xList : *change->extraData) {
+					if (IsWornList(xList)) {
+						return xList;
+					}
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	// names for the UE4SS mod (it marks these items in the steal list)
+	void WriteWornFile(const std::vector<Copy>& a_copies)
+	{
+		std::ofstream file("PickpocketPlus_worn.txt", std::ios::trunc);
+		if (!file) {
+			REX::WARN("could not write PickpocketPlus_worn.txt");
+			return;
+		}
+		for (auto& c : a_copies) {
+			if (auto name = RE::TESFullName::GetFullName(c.object); name && *name) {
+				file << name << "\n";
+			}
+		}
+	}
+
+	void Cleanup()
+	{
+		auto npc = LookupNPC(g_prepID);
+		if (npc) {
+			int removedCopies = 0, takenWorn = 0;
+			for (auto& c : g_copies) {
+				const std::int32_t now = npc->GetItemCountInContainer(c.object);
+				if (now >= c.countWithCopy) {
+					// copy still there: remove it, and make sure the real piece is still worn
+					npc->RemoveItem(c.object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
+					++removedCopies;
+					if (!WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
+						npc->EquipObject(c.object, 1, nullptr);
+					}
+				} else {
+					// the copy was stolen: the real worn piece goes too
+					if (auto worn = WornListOf(npc, c.object)) {
+						npc->UnequipObject(c.object, 1, worn, true);
+					}
+					if (npc->GetItemCountInContainer(c.object) > 0) {
+						npc->RemoveItem(c.object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
+					}
+					++takenWorn;
+					REX::INFO("  {:08X} was stolen - real worn piece removed", c.object->formID);
+				}
+			}
+			REX::INFO("PPCleanupTarget: {:08X}: {} copies removed, {} worn pieces taken", g_prepID, removedCopies, takenWorn);
+		}
+		g_copies.clear();
+		g_prepID = 0;
+		WriteWornFile(g_copies);
+	}
+
+	bool ExecutePrepare(
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
@@ -141,86 +197,71 @@ namespace PPXP
 		}
 
 		auto im = RE::InterfaceManager::GetInstance(false, false);
-		RE::Actor* npc = nullptr;
-		if (im) {
-			npc = AsNPC(im->activateRef);
-			if (npc) {
-				REX::INFO("target from activation: {:08X}", npc->formID);
-			} else if ((npc = AsNPC(im->crosshairRef))) {
-				REX::INFO("target from crosshair: {:08X}", npc->formID);
+		auto npc = im ? AsNPC(im->crosshairRef) : nullptr;
+		if (npc && DistanceToPlayer(npc) > maxDist) {
+			npc = nullptr;
+		}
+		if (!npc) {
+			// not aiming at anyone in reach: drop the prepared NPC once we've walked away from them
+			if (g_prepID) {
+				auto prepared = LookupNPC(g_prepID);
+				if (!prepared || DistanceToPlayer(prepared) > maxDist * 1.5f) {
+					Cleanup();
+				}
 			}
-		}
-		if (!npc) {
-			npc = FindNearestNPC(maxDist);
-		}
-		if (!npc) {
-			REX::INFO("PPStripTarget: no NPC within {:.0f}", maxDist);
 			return true;
 		}
-		auto xChanges = npc->extra.GetExtraData<RE::ExtraContainerChanges>();
-		if (!xChanges || !xChanges->changes || !xChanges->changes->list) {
-			REX::INFO("PPStripTarget: NPC has no inventory changes");
-			return true;
+		if (npc->formID == g_prepID) {
+			return true;  // already prepared
+		}
+		if (g_prepID) {
+			Cleanup();
 		}
 
-		// collect first, unequip after (don't change the list while walking it)
-		std::vector<std::pair<RE::TESBoundObject*, RE::ExtraDataList*>> worn;
-		for (auto change : *xChanges->changes->list) {
+		auto changes = ChangesOf(npc);
+		if (!changes) {
+			return true;
+		}
+		std::vector<RE::TESBoundObject*> worn;
+		for (auto change : *changes->list) {
 			if (!change || !change->object || !change->extraData) {
 				continue;
 			}
+			bool isWorn = false;
 			for (auto xList : *change->extraData) {
-				if (xList && (xList->GetExtraData(RE::EXTRA_DATA_TYPE::Worn) || xList->GetExtraData(RE::EXTRA_DATA_TYPE::WornLeft))) {
-					if (skipProtected && IsProtected(change->object)) {
-						REX::INFO("  {:08X} is a quest/scripted item - left on", change->object->formID);
-						continue;
-					}
-					worn.emplace_back(change->object, xList);
+				if (IsWornList(xList)) {
+					isWorn = true;
+					break;
 				}
 			}
+			if (!isWorn || change->object->Is(RE::FormType::Ammo)) {
+				continue;  // ammo stacks make "was the copy taken?" ambiguous
+			}
+			if (skipProtected && IsProtected(change->object)) {
+				continue;
+			}
+			worn.push_back(change->object);
 		}
 
-		g_targetID = npc->formID;
-		g_stripped.clear();
-		for (auto& [object, xList] : worn) {
-			const bool ok = npc->UnequipObject(object, 1, xList, true);
-			REX::INFO("  unequip {:08X}: {}", object->formID, ok ? "ok" : "failed");
-			g_stripped.push_back(object);
+		g_prepID = npc->formID;
+		g_copies.clear();
+		for (auto object : worn) {
+			npc->AddObjectToContainer(object, nullptr, 1);
+			g_copies.push_back({ object, npc->GetItemCountInContainer(object) });
 		}
-		REX::INFO("PPStripTarget: {} worn item(s) unequipped on {:08X}", g_stripped.size(), g_targetID);
-		a_result = static_cast<double>(g_stripped.size());
+		WriteWornFile(g_copies);
+		REX::INFO("PPPrepareTarget: {:08X}: {} worn item copies added", g_prepID, g_copies.size());
+		a_result = static_cast<double>(g_copies.size());
 		return true;
 	}
 
-	bool ExecuteRestore(
+	bool ExecuteCleanup(
 		const RE::SCRIPT_PARAMETER*, const char*, RE::TESObjectREFR*, RE::TESObjectREFR*, RE::Script*, RE::ScriptLocals*, double& a_result, std::uint32_t&)
 	{
 		a_result = 0.0;
-		if (!g_targetID || g_stripped.empty()) {
-			return true;
+		if (g_prepID) {
+			Cleanup();
 		}
-		auto form = RE::TESForm::LookupByID(g_targetID);
-		auto npc = (form && form->Is(RE::FormType::ActorCharacter)) ? static_cast<RE::Actor*>(form) : nullptr;
-		if (!npc) {
-			REX::INFO("PPRestoreTarget: NPC {:08X} not found", g_targetID);
-			g_stripped.clear();
-			g_targetID = 0;
-			return true;
-		}
-		int restored = 0;
-		for (auto object : g_stripped) {
-			if (npc->GetItemCountInContainer(object) > 0) {
-				npc->EquipObject(object, 1, nullptr);
-				++restored;
-			} else {
-				REX::INFO("  {:08X} is gone (stolen)", object->formID);
-			}
-		}
-		REX::INFO("PPRestoreTarget: {} item(s) re-equipped on {:08X}", restored, g_targetID);
-
-		a_result = restored;
-		g_stripped.clear();
-		g_targetID = 0;
 		return true;
 	}
 
@@ -246,7 +287,6 @@ namespace PPXP
 
 	void Install()
 	{
-		// unused debug commands we may take over, in order
 		constexpr std::array victims{
 			"OutputMemContexts"sv, "OutputMemStats"sv, "OutputArchiveProfile"sv, "TestCode"sv,
 			"OutputLocalMapPictures"sv, "TestSeenData"sv
@@ -261,16 +301,17 @@ namespace PPXP
 			REX::ERROR("no free console command left for {}", a_name);
 		};
 
-		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_params, &Execute);
-		take("PPStripTarget", "ppstrip", "PickpocketPlus: unequips the NPC's worn items (PPStripTarget <maxDistance> <skipQuestAndScripted>)", g_stripParams, &ExecuteStrip);
-		take("PPRestoreTarget", "pprestore", "PickpocketPlus: re-equips what PPStripTarget took off", g_distParams, &ExecuteRestore);
+		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_xpParams, &ExecuteAddXP);
+		take("PPPrepareTarget", "ppprep", "PickpocketPlus: copies the aimed NPC's worn items (PPPrepareTarget <maxDistance> <skipProtected>)", g_prepParams, &ExecutePrepare);
+		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes leftover worn-item copies", g_noParams, &ExecuteCleanup);
+		WriteWornFile(g_copies);  // start with an empty file
 	}
 }
 
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.8 loaded");
+	REX::INFO("PickpocketPlus 0.9 loaded");
 	PPXP::Install();
 	return true;
 }
