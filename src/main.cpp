@@ -1,4 +1,7 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.13
+// PickpocketPlus (OBSE64 plugin) — version 0.15
+// v0.15: a piece the AI took off (e.g. the shield) is put back after 0.5 s of settling instead of 2 s.
+// v0.14: "PPCleanupTarget 1" only forgets the prepared NPC without touching their inventory (used after a save
+//        is loaded: the reloaded NPC has no copies, so a normal cleanup would wrongly take real pieces).
 // v0.13: crash safety: a piece the AI took off is put back on only once, and only after the NPC has had
 //        2 s to settle after the copies were added (no tug-of-war with the AI).
 // v0.12: keeps the prepared NPC dressed: if the game's AI takes a real piece off after the copies were added
@@ -70,8 +73,8 @@ namespace PPXP
 		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
 		{ "skipProtected", RE::SCRIPT_PARAM_TYPE::kInt, true }
 	};
-	RE::SCRIPT_PARAMETER g_noParams[] = {
-		{ "unused", RE::SCRIPT_PARAM_TYPE::kInt, true }
+	RE::SCRIPT_PARAMETER g_cleanupParams[] = {
+		{ "forgetOnly", RE::SCRIPT_PARAM_TYPE::kInt, true }
 	};
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
@@ -268,7 +271,7 @@ namespace PPXP
 		}
 		if (npc->formID == g_prepID) {
 			// already prepared: make sure the AI didn't take a real piece off (e.g. the shield)
-			if (std::chrono::steady_clock::now() - g_prepTime < std::chrono::seconds(2)) {
+			if (std::chrono::steady_clock::now() - g_prepTime < std::chrono::milliseconds(500)) {
 				return true;  // let the NPC settle first
 			}
 			for (auto& c : g_copies) {
@@ -323,12 +326,23 @@ namespace PPXP
 	}
 
 	bool ExecuteCleanup(
-		const RE::SCRIPT_PARAMETER*, const char*, RE::TESObjectREFR*, RE::TESObjectREFR*, RE::Script*, RE::ScriptLocals*, double& a_result, std::uint32_t&)
+		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
+		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
 		a_result = 0.0;
-		if (g_prepID) {
-			Cleanup();
+		std::int32_t forgetOnly = 0;
+		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &forgetOnly);
+		if (!g_prepID) {
+			return true;
 		}
+		if (forgetOnly) {
+			REX::INFO("PPCleanupTarget: forgetting {:08X} after a load (inventory untouched)", g_prepID);
+			g_copies.clear();
+			g_prepID = 0;
+			WriteWornFile(g_copies);
+			return true;
+		}
+		Cleanup();
 		return true;
 	}
 
@@ -370,7 +384,7 @@ namespace PPXP
 
 		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_xpParams, &ExecuteAddXP);
 		take("PPPrepareTarget", "ppprep", "PickpocketPlus: copies the aimed NPC's worn items (PPPrepareTarget <maxDistance> <skipProtected>)", g_prepParams, &ExecutePrepare);
-		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes leftover worn-item copies", g_noParams, &ExecuteCleanup);
+		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes leftover worn-item copies (PPCleanupTarget <forgetOnly>)", g_cleanupParams, &ExecuteCleanup);
 		WriteWornFile(g_copies);  // start with an empty file
 	}
 }
@@ -378,7 +392,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.13 loaded");
+	REX::INFO("PickpocketPlus 0.15 loaded");
 	PPXP::Install();
 	return true;
 }
