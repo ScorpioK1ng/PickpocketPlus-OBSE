@@ -1,11 +1,10 @@
--- PickpocketPlus (OBSE64 plugin) — version 0.8
--- Adds the console command "PPAddSneakXP <amount>", which the PickpocketPlus UE4SS mod calls
--- after each successful steal to give the bonus Sneak XP.
+-- PickpocketPlus (OBSE64 plugin) — version 0.9
+-- Console commands for the PickpocketPlus UE4SS mod: bonus Sneak XP and worn-gear copies.
 
 includes("lib/commonlibob64")
 
 set_project("PickpocketPlus")
-set_version("0.8.0")
+set_version("0.9.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
