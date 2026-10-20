@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.12
+// PickpocketPlus (OBSE64 plugin) — version 0.13
+// v0.13: crash safety: a piece the AI took off is put back on only once, and only after the NPC has had
+//        2 s to settle after the copies were added (no tug-of-war with the AI).
 // v0.12: keeps the prepared NPC dressed: if the game's AI takes a real piece off after the copies were added
 //        (e.g. the shield), it is put back on (up to 3 tries per item) on the next prepare call.
 // v0.11: PickpocketPlus_worn.txt lines are "name|value|weight" (the UE4SS mod can match items by value and
@@ -60,8 +62,9 @@ namespace PPXP
 		int                 redressTries = 0;
 	};
 
-	RE::TESFormID     g_prepID = 0;
-	std::vector<Copy> g_copies;
+	RE::TESFormID                         g_prepID = 0;
+	std::vector<Copy>                     g_copies;
+	std::chrono::steady_clock::time_point g_prepTime{};
 
 	RE::SCRIPT_PARAMETER g_prepParams[] = {
 		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
@@ -265,11 +268,14 @@ namespace PPXP
 		}
 		if (npc->formID == g_prepID) {
 			// already prepared: make sure the AI didn't take a real piece off (e.g. the shield)
+			if (std::chrono::steady_clock::now() - g_prepTime < std::chrono::seconds(2)) {
+				return true;  // let the NPC settle first
+			}
 			for (auto& c : g_copies) {
-				if (c.redressTries < 3 && !WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
+				if (c.redressTries < 1 && !WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
 					++c.redressTries;
 					npc->EquipObject(c.object, 1, nullptr);
-					REX::INFO("  {:08X} was taken off by the AI - put back on (try {})", c.object->formID, c.redressTries);
+					REX::INFO("  {:08X} was taken off by the AI - put back on", c.object->formID);
 				}
 			}
 			return true;
@@ -304,6 +310,7 @@ namespace PPXP
 		}
 
 		g_prepID = npc->formID;
+		g_prepTime = std::chrono::steady_clock::now();
 		g_copies.clear();
 		for (auto object : worn) {
 			npc->AddObjectToContainer(object, nullptr, 1);
@@ -371,7 +378,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.12 loaded");
+	REX::INFO("PickpocketPlus 0.13 loaded");
 	PPXP::Install();
 	return true;
 }
