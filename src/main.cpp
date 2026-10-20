@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.11
+// PickpocketPlus (OBSE64 plugin) — version 0.12
+// v0.12: keeps the prepared NPC dressed: if the game's AI takes a real piece off after the copies were added
+//        (e.g. the shield), it is put back on (up to 3 tries per item) on the next prepare call.
 // v0.11: PickpocketPlus_worn.txt lines are "name|value|weight" (the UE4SS mod can match items by value and
 //        weight if the names differ from the menu's); each line is also logged.
 // v0.10: target = crosshair NPC if the game reports one, otherwise the nearest NPC in reach (the crosshair
@@ -55,6 +57,7 @@ namespace PPXP
 	{
 		RE::TESBoundObject* object;
 		std::int32_t        countWithCopy;  // NPC's count of this item right after the copy was added
+		int                 redressTries = 0;
 	};
 
 	RE::TESFormID     g_prepID = 0;
@@ -261,7 +264,15 @@ namespace PPXP
 			return true;
 		}
 		if (npc->formID == g_prepID) {
-			return true;  // already prepared
+			// already prepared: make sure the AI didn't take a real piece off (e.g. the shield)
+			for (auto& c : g_copies) {
+				if (c.redressTries < 3 && !WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
+					++c.redressTries;
+					npc->EquipObject(c.object, 1, nullptr);
+					REX::INFO("  {:08X} was taken off by the AI - put back on (try {})", c.object->formID, c.redressTries);
+				}
+			}
+			return true;
 		}
 		if (g_prepID) {
 			Cleanup();
@@ -360,7 +371,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.11 loaded");
+	REX::INFO("PickpocketPlus 0.12 loaded");
 	PPXP::Install();
 	return true;
 }
