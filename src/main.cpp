@@ -1,4 +1,4 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.27
+// PickpocketPlus (OBSE64 plugin) — version 0.28
 // Companion DLL for the PickpocketPlus UE4SS mod - NO CONSOLE COMMANDS anymore (the game's console crashed
 // now and then when a command landed at a bad moment). Instead:
 //   - the UE4SS mod writes PickpocketPlus_bridge.txt (sneaking, steal menu open, loads, area changes, bonus XP
@@ -8,6 +8,8 @@
 //     per-frame update, i.e. at a moment the game is in a stable state by definition.
 // Files: PickpocketPlus_worn.txt (worn copies, for the UE4SS mod), PickpocketPlus_ledger.txt (save repair).
 //
+// v0.28: fix: the game's own "menu mode" flag is always on in the Remaster (so nothing was ever prepared);
+//        pause detection now comes from the UE4SS mod ("paused" in the status file).
 // v0.27: never touches NPCs while the game is loading or changing areas (the UE4SS mod sets "wait" in the
 //        status file the moment a load/fade starts); a failed task hand-off can no longer stall the work.
 // v0.26: startup fix: nothing is sent to the game thread until the UE4SS mod has written a FRESH status file
@@ -416,6 +418,7 @@ namespace PPXP
 		float       dist = 300.0f;
 		bool        skip = true;
 		bool        wait = false;   // loading / changing areas: hands off
+		bool        paused = false; // game paused (pause menu, alt-tab): no item work
 	};
 
 	std::mutex g_bridgeLock;
@@ -446,6 +449,7 @@ namespace PPXP
 			else if (key == "dist") b.dist = static_cast<float>(v);
 			else if (key == "skip") b.skip = v != 0.0;
 			else if (key == "wait") b.wait = v != 0.0;
+			else if (key == "paused") b.paused = v != 0.0;
 		}
 		b.valid = ended;  // only a fully written file counts
 		return b;
@@ -543,12 +547,6 @@ namespace PPXP
 		g_xpApplied = a_total;
 	}
 
-	bool GameMenuOpen()
-	{
-		auto im = RE::InterfaceManager::GetInstance(false, false);
-		return im && im->menuMode != 0;
-	}
-
 	void Tick()
 	{
 		const auto now = Clock::now();
@@ -598,19 +596,13 @@ namespace PPXP
 			}
 			g_seenArea = b.area;
 		}
-		const bool anyMenu = GameMenuOpen();
-		static int lastMenuState = -1;
-		if (static_cast<int>(anyMenu) != lastMenuState) {
-			lastMenuState = static_cast<int>(anyMenu);
-			REX::INFO("game menu mode: {}", anyMenu ? "on" : "off");
-		}
-		if (g_repairPending && now >= g_repairAt && !b.menu && !anyMenu) {
+		if (g_repairPending && now >= g_repairAt && !b.menu && !b.paused) {
 			g_repairPending = false;
 			RepairAfterLoad();
 		}
 
 		if (!b.on) {
-			if (g_prepID && !b.menu && !anyMenu) {
+			if (g_prepID && !b.menu && !b.paused) {
 				Cleanup();
 			}
 			return;
@@ -621,8 +613,8 @@ namespace PPXP
 			g_menuWasOpen = true;
 			return;
 		}
-		if (anyMenu) {
-			return;  // pause menu, inventory, console...: never touch NPCs then
+		if (b.paused) {
+			return;  // pause menu / alt-tab: never touch NPCs then
 		}
 		if (g_menuWasOpen) {
 			g_menuWasOpen = false;
@@ -669,7 +661,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.27 loaded");
+	REX::INFO("PickpocketPlus 0.28 loaded");
 	PPXP::Install();
 	return true;
 }
