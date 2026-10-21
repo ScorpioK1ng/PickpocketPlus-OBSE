@@ -1,10 +1,12 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.24
+// PickpocketPlus (OBSE64 plugin) — version 0.25
 #pragma once
 
 #include <RE/Oblivion.h>
 #include <OBSE/OBSE.h>
+#include <UE/Unreal.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>

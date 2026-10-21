@@ -1,4 +1,4 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.24
+// PickpocketPlus (OBSE64 plugin) — version 0.25
 // Companion DLL for the PickpocketPlus UE4SS mod - NO CONSOLE COMMANDS anymore (the game's console crashed
 // now and then when a command landed at a bad moment). Instead:
 //   - the UE4SS mod writes PickpocketPlus_bridge.txt (sneaking, steal menu open, loads, area changes, bonus XP
@@ -8,6 +8,9 @@
 //     per-frame update, i.e. at a moment the game is in a stable state by definition.
 // Files: PickpocketPlus_worn.txt (worn copies, for the UE4SS mod), PickpocketPlus_ledger.txt (save repair).
 //
+// v0.25: the per-frame work is now queued onto the game thread through Unreal's own task system (the player
+//        update hook never ran in 0.24); skips all item work while any game menu is open; logs once when the
+//        status file is found and when the game-thread work starts.
 // v0.24: console-free rewrite (status file + player update hook); held weapons are copied again.
 // History: 0.1-0.4 Sneak XP; 0.5-0.8 worn gear by undressing; 0.9-0.23 worn gear via copies (console based).
 
@@ -448,12 +451,34 @@ namespace PPXP
 	}
 
 	// background thread: read the bridge, apply the worn penalty right away (works while menus are open)
+	void Tick();  // defined further down, runs on the game thread
+
+	std::atomic<bool> g_taskQueued{ false };
+
 	void BridgeThread(std::stop_token a_stop)
 	{
 		RE::Setting* amountBase = nullptr;
 		float        applied = 1e9f;
+		bool         reportedFound = false, reportedMissing = false;
+		int          loops = 0;
 		while (!a_stop.stop_requested()) {
 			auto b = ReadBridgeFile();
+			if (!b.valid && !reportedMissing && !reportedFound) {
+				reportedMissing = true;
+				std::error_code ec;
+				REX::INFO("waiting for {} (written by the UE4SS mod)", std::filesystem::absolute("PickpocketPlus_bridge.txt", ec).string());
+			}
+			if (b.valid && !reportedFound) {
+				reportedFound = true;
+				REX::INFO("status file found - connected to the UE4SS mod");
+			}
+			// every ~200 ms: run the item work on the game thread (one task at a time)
+			if (++loops % 4 == 0 && !g_taskQueued.exchange(true)) {
+				UE::AsyncTask(UE::ENamedThreads::GameThread, []() {
+					Tick();
+					g_taskQueued = false;
+				});
+			}
 			if (b.valid) {
 				{
 					std::lock_guard lock(g_bridgeLock);
@@ -497,13 +522,25 @@ namespace PPXP
 		g_xpApplied = a_total;
 	}
 
+	bool GameMenuOpen()
+	{
+		auto im = RE::InterfaceManager::GetInstance(false, false);
+		return im && im->menuMode != 0;
+	}
+
 	void Tick()
 	{
 		const auto now = Clock::now();
 		if (now < g_nextTick) {
 			return;
 		}
-		g_nextTick = now + std::chrono::milliseconds(250);
+		g_nextTick = now + std::chrono::milliseconds(200);
+
+		static bool announced = false;
+		if (!announced) {
+			announced = true;
+			REX::INFO("game-thread work is running");
+		}
 
 		const auto b = CurrentBridge();
 		if (!b.valid) {
@@ -532,13 +569,19 @@ namespace PPXP
 			}
 			g_seenArea = b.area;
 		}
-		if (g_repairPending && now >= g_repairAt && !b.menu) {
+		const bool anyMenu = GameMenuOpen();
+		static int lastMenuState = -1;
+		if (static_cast<int>(anyMenu) != lastMenuState) {
+			lastMenuState = static_cast<int>(anyMenu);
+			REX::INFO("game menu mode: {}", anyMenu ? "on" : "off");
+		}
+		if (g_repairPending && now >= g_repairAt && !b.menu && !anyMenu) {
 			g_repairPending = false;
 			RepairAfterLoad();
 		}
 
 		if (!b.on) {
-			if (g_prepID && !b.menu) {
+			if (g_prepID && !b.menu && !anyMenu) {
 				Cleanup();
 			}
 			return;
@@ -548,6 +591,9 @@ namespace PPXP
 		if (b.menu) {
 			g_menuWasOpen = true;
 			return;
+		}
+		if (anyMenu) {
+			return;  // pause menu, inventory, console...: never touch NPCs then
 		}
 		if (g_menuWasOpen) {
 			g_menuWasOpen = false;
@@ -608,7 +654,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.24 loaded");
+	REX::INFO("PickpocketPlus 0.25 loaded");
 	PPXP::Install();
 	return true;
 }
