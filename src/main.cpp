@@ -1,4 +1,4 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.25
+// PickpocketPlus (OBSE64 plugin) — version 0.27
 // Companion DLL for the PickpocketPlus UE4SS mod - NO CONSOLE COMMANDS anymore (the game's console crashed
 // now and then when a command landed at a bad moment). Instead:
 //   - the UE4SS mod writes PickpocketPlus_bridge.txt (sneaking, steal menu open, loads, area changes, bonus XP
@@ -8,6 +8,11 @@
 //     per-frame update, i.e. at a moment the game is in a stable state by definition.
 // Files: PickpocketPlus_worn.txt (worn copies, for the UE4SS mod), PickpocketPlus_ledger.txt (save repair).
 //
+// v0.27: never touches NPCs while the game is loading or changing areas (the UE4SS mod sets "wait" in the
+//        status file the moment a load/fade starts); a failed task hand-off can no longer stall the work.
+// v0.26: startup fix: nothing is sent to the game thread until the UE4SS mod has written a FRESH status file
+//        in this session (+3 s) - 0.25 queued work while the engine was still starting (game wouldn't launch,
+//        an old status file from the last session was already on disk). Player update hook removed.
 // v0.25: the per-frame work is now queued onto the game thread through Unreal's own task system (the player
 //        update hook never ran in 0.24); skips all item work while any game menu is open; logs once when the
 //        status file is found and when the game-thread work starts.
@@ -410,6 +415,7 @@ namespace PPXP
 		float       penalty = 0.0f; // fPickPocketAmountBase to use right now
 		float       dist = 300.0f;
 		bool        skip = true;
+		bool        wait = false;   // loading / changing areas: hands off
 	};
 
 	std::mutex g_bridgeLock;
@@ -439,6 +445,7 @@ namespace PPXP
 			else if (key == "pen") b.penalty = static_cast<float>(v);
 			else if (key == "dist") b.dist = static_cast<float>(v);
 			else if (key == "skip") b.skip = v != 0.0;
+			else if (key == "wait") b.wait = v != 0.0;
 		}
 		b.valid = ended;  // only a fully written file counts
 		return b;
@@ -461,8 +468,18 @@ namespace PPXP
 		float        applied = 1e9f;
 		bool         reportedFound = false, reportedMissing = false;
 		int          loops = 0;
+		const auto   started = std::filesystem::file_time_type::clock::now();
+		auto         readyAt = Clock::time_point::max();   // game-thread work only once the game is up
 		while (!a_stop.stop_requested()) {
 			auto b = ReadBridgeFile();
+			if (b.valid) {
+				// only a status file written in THIS session counts (an old one is still on disk at startup)
+				std::error_code ec;
+				const auto written = std::filesystem::last_write_time("PickpocketPlus_bridge.txt", ec);
+				if (ec || written < started) {
+					b.valid = false;
+				}
+			}
 			if (!b.valid && !reportedMissing && !reportedFound) {
 				reportedMissing = true;
 				std::error_code ec;
@@ -470,14 +487,18 @@ namespace PPXP
 			}
 			if (b.valid && !reportedFound) {
 				reportedFound = true;
+				readyAt = Clock::now() + std::chrono::seconds(3);
 				REX::INFO("status file found - connected to the UE4SS mod");
 			}
 			// every ~200 ms: run the item work on the game thread (one task at a time)
-			if (++loops % 4 == 0 && !g_taskQueued.exchange(true)) {
-				UE::AsyncTask(UE::ENamedThreads::GameThread, []() {
+			if (Clock::now() >= readyAt && ++loops % 4 == 0 && !g_taskQueued.exchange(true)) {
+				const bool queued = UE::AsyncTask(UE::ENamedThreads::GameThread, []() {
 					Tick();
 					g_taskQueued = false;
 				});
+				if (!queued) {
+					g_taskQueued = false;  // try again next round
+				}
 			}
 			if (b.valid) {
 				{
@@ -548,6 +569,14 @@ namespace PPXP
 		}
 
 		ApplyXP(b.xp);
+
+		// loading or changing areas: hands off until the UE4SS mod says the world is ready again
+		if (b.wait) {
+			return;
+		}
+		if (auto player = RE::PlayerCharacter::GetSingleton(); !player || !player->parentCell) {
+			return;
+		}
 
 		// a save was loaded: forget (the NPC was reloaded without our copies), repair saved copies a bit later
 		if (b.load != g_seenLoad) {
@@ -628,24 +657,10 @@ namespace PPXP
 		}
 	}
 
-	// ---------------- hooks ----------------
-	struct PlayerUpdateHook
-	{
-		static void Thunk(RE::PlayerCharacter* a_this, float a_delta)
-		{
-			func(a_this, a_delta);
-			Tick();
-		}
-		static inline REL::Relocation<decltype(Thunk)> func;
-	};
-
 	std::jthread g_bridgeThread;
 
 	void Install()
 	{
-		REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE::PlayerCharacter[0] };
-		PlayerUpdateHook::func = vtbl.write_vfunc(0x99, PlayerUpdateHook::Thunk);
-		REX::INFO("hooked the player update");
 		WriteWornFile(g_copies);  // start with an empty file
 		g_bridgeThread = std::jthread(BridgeThread);
 	}
@@ -654,7 +669,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.25 loaded");
+	REX::INFO("PickpocketPlus 0.27 loaded");
 	PPXP::Install();
 	return true;
 }
