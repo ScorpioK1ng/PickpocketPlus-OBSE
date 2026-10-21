@@ -1,48 +1,22 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.22
-// Companion DLL for the PickpocketPlus UE4SS mod. Console commands (each takes over an unused debug command):
-//     PPAddSneakXP <amount>                         adds Sneak XP (game units: 2 per pickpocket)
-//     PPPrepareTarget <maxDistance> <skipProtected> adds unequipped copies of the worn items of the NPC in front
-//                                                   of you (worn gear shows in their steal menu, they stay dressed)
-//     PPCleanupTarget <0|1|2>                       0 = remove untaken copies / the real pieces you stole,
-//                                                   1 = forget after a load, 2 = forget + repair saved copies
+// PickpocketPlus (OBSE64 plugin) — version 0.24
+// Companion DLL for the PickpocketPlus UE4SS mod - NO CONSOLE COMMANDS anymore (the game's console crashed
+// now and then when a command landed at a bad moment). Instead:
+//   - the UE4SS mod writes PickpocketPlus_bridge.txt (sneaking, steal menu open, loads, area changes, bonus XP
+//     total, worn penalty);
+//   - a small background thread reads it every 50 ms and applies the worn penalty (a game setting) at once;
+//   - everything else (copies of worn gear, cleanup, save repair, bonus XP) runs inside the player's own
+//     per-frame update, i.e. at a moment the game is in a stable state by definition.
+// Files: PickpocketPlus_worn.txt (worn copies, for the UE4SS mod), PickpocketPlus_ledger.txt (save repair).
 //
-// v0.22: cleanup: crash-hunt trace file and per-item log lines removed.
-// History: 0.1-0.4 Sneak XP; 0.5-0.8 worn gear by undressing; 0.9-0.21 worn gear via copies (targeting, AI
-// re-dress, quiet times, save repair ledger).
+// v0.24: console-free rewrite (status file + player update hook); held weapons are copied again.
+// History: 0.1-0.4 Sneak XP; 0.5-0.8 worn gear by undressing; 0.9-0.23 worn gear via copies (console based).
 
 namespace PPXP
 {
+	using Clock = std::chrono::steady_clock;
+
 	constexpr std::int32_t kSneak = 31;       // actor value index of Sneak
 	constexpr std::int32_t kFirstSkill = 12;  // TESDataHandler::skill[0] is Armorer (12)
-
-	// ---------------- Sneak XP ----------------
-	RE::SCRIPT_PARAMETER g_xpParams[] = {
-		{ "amount", RE::SCRIPT_PARAM_TYPE::kFloat, false }
-	};
-
-	bool ExecuteAddXP(
-		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
-		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
-	{
-		a_result = 0.0;
-		float amount = 0.0f;
-		if (!RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &amount)) {
-			return true;
-		}
-		auto player = RE::PlayerCharacter::GetSingleton();
-		if (!player) {
-			return true;
-		}
-		constexpr std::int32_t slot = kSneak - kFirstSkill;
-		const float before = player->skillUsage[slot];
-		const float needed = player->skillAdvancementUses[slot];
-		if (amount > 0.0f) {
-			player->skillUsage[slot] = before + amount;
-		}
-		REX::INFO("PPAddSneakXP: +{:.3f} -> Sneak XP {:.3f} / {:.3f}", amount, player->skillUsage[slot], needed);
-		a_result = amount;
-		return true;
-	}
 
 	// ---------------- worn-gear copies ----------------
 	struct Copy
@@ -58,13 +32,6 @@ namespace PPXP
 	RE::TESFormID                         g_lastCleanID = 0;
 	std::chrono::steady_clock::time_point g_lastCleanTime{};
 
-	RE::SCRIPT_PARAMETER g_prepParams[] = {
-		{ "maxDistance", RE::SCRIPT_PARAM_TYPE::kFloat, true },
-		{ "skipProtected", RE::SCRIPT_PARAM_TYPE::kInt, true }
-	};
-	RE::SCRIPT_PARAMETER g_cleanupParams[] = {
-		{ "forgetOnly", RE::SCRIPT_PARAM_TYPE::kInt, true }
-	};
 
 	RE::Actor* AsNPC(RE::TESObjectREFR* a_ref)
 	{
@@ -296,7 +263,7 @@ namespace PPXP
 				npc->EquipObject(object, 1, nullptr);
 			}
 		}
-		REX::INFO("PPCleanupTarget: repair after load - {} saved copies removed", repaired);
+		REX::INFO("cleanup: repair after load - {} saved copies removed", repaired);
 	}
 
 	void Cleanup()
@@ -325,7 +292,7 @@ namespace PPXP
 					REX::INFO("  {:08X} was stolen - real worn piece removed", c.object->formID);
 				}
 			}
-			REX::INFO("PPCleanupTarget: {:08X}: {} copies removed, {} worn pieces taken", g_prepID, removedCopies, takenWorn);
+			REX::INFO("cleanup: {:08X}: {} copies removed, {} worn pieces taken", g_prepID, removedCopies, takenWorn);
 		}
 		g_lastCleanID = g_prepID;
 		g_lastCleanTime = std::chrono::steady_clock::now();
@@ -334,43 +301,35 @@ namespace PPXP
 		WriteWornFile(g_copies);
 	}
 
-	bool ExecutePrepare(
-		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
-		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
-	{
-		a_result = 0.0;
-		float        maxDist = 300.0f;
-		std::int32_t skipProtected = 1;
-		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &maxDist, &skipProtected);
-		if (maxDist <= 0.0f) {
-			maxDist = 300.0f;
-		}
 
+	// ---------------- copies: prepare (game thread only) ----------------
+	void Prepare(float a_maxDist, bool a_skipProtected)
+	{
 		auto im = RE::InterfaceManager::GetInstance(false, false);
 		auto npc = im ? AsNPC(im->crosshairRef) : nullptr;
-		if (npc && DistanceToPlayer(npc) > maxDist) {
+		if (npc && DistanceToPlayer(npc) > a_maxDist) {
 			npc = nullptr;
 		}
 		if (!npc) {
-			npc = FindTargetNPC(maxDist);
+			npc = FindTargetNPC(a_maxDist);
 		}
 		if (!npc) {
-			npc = FindNearestNPC(maxDist);
+			npc = FindNearestNPC(a_maxDist);
 		}
 		if (!npc) {
 			// nobody in reach: drop the prepared NPC once we've walked away from them
 			if (g_prepID) {
 				auto prepared = LookupNPC(g_prepID);
-				if (!prepared || DistanceToPlayer(prepared) > maxDist * 1.5f) {
+				if (!prepared || DistanceToPlayer(prepared) > a_maxDist * 1.5f) {
 					Cleanup();
 				}
 			}
-			return true;
+			return;
 		}
 		if (npc->formID == g_prepID) {
 			// already prepared: make sure the AI didn't take a real piece off (e.g. the shield)
-			if (std::chrono::steady_clock::now() - g_prepTime < std::chrono::seconds(2)) {
-				return true;  // let the NPC settle first
+			if (Clock::now() - g_prepTime < std::chrono::seconds(2)) {
+				return;
 			}
 			for (auto& c : g_copies) {
 				if (c.redressTries < 1 && !WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
@@ -379,18 +338,18 @@ namespace PPXP
 					REX::INFO("  {:08X} was taken off by the AI - put back on", c.object->formID);
 				}
 			}
-			return true;
+			return;
 		}
 		if (g_prepID) {
 			Cleanup();  // switched to another NPC: the old one gets their real gear back first
 		}
-		if (npc->formID == g_lastCleanID && std::chrono::steady_clock::now() - g_lastCleanTime < std::chrono::seconds(5)) {
-			return true;  // this NPC's AI may still be re-checking its gear after the last cleanup
+		if (npc->formID == g_lastCleanID && Clock::now() - g_lastCleanTime < std::chrono::seconds(5)) {
+			return;  // this NPC's AI may still be re-checking its gear after the last cleanup
 		}
 
 		auto changes = ChangesOf(npc);
 		if (!changes) {
-			return true;
+			return;
 		}
 		std::vector<RE::TESBoundObject*> worn;
 		for (auto change : *changes->list) {
@@ -407,14 +366,14 @@ namespace PPXP
 			if (!isWorn || change->object->Is(RE::FormType::Ammo)) {
 				continue;  // ammo stacks make "was the copy taken?" ambiguous
 			}
-			if (skipProtected && IsProtected(change->object)) {
+			if (a_skipProtected && IsProtected(change->object)) {
 				continue;
 			}
 			worn.push_back(change->object);
 		}
 
 		g_prepID = npc->formID;
-		g_prepTime = std::chrono::steady_clock::now();
+		g_prepTime = Clock::now();
 		g_copies.clear();
 		for (auto object : worn) {
 			RememberCopy(npc->formID, object->formID, npc->GetItemCountInContainer(object));
@@ -422,84 +381,234 @@ namespace PPXP
 			g_copies.push_back({ object, npc->GetItemCountInContainer(object) });
 		}
 		WriteWornFile(g_copies);
-		REX::INFO("PPPrepareTarget: {:08X}: {} worn item copies added", g_prepID, g_copies.size());
-		a_result = static_cast<double>(g_copies.size());
-		return true;
+		REX::INFO("prepare: {:08X}: {} worn item copies added", g_prepID, g_copies.size());
 	}
 
-	bool ExecuteCleanup(
-		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
-		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
+	void Forget()
 	{
-		a_result = 0.0;
-		std::int32_t forgetOnly = 0;
-		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &forgetOnly);
-		if (forgetOnly) {
-			// 1 = after a load: forget the old state; 2 = also repair saves that captured copies
-			if (g_prepID) {
-				REX::INFO("PPCleanupTarget: forgetting {:08X} after a load (inventory untouched)", g_prepID);
-			}
-			g_copies.clear();
-			g_prepID = 0;
-			WriteWornFile(g_copies);
-			if (forgetOnly == 2) {
-				RepairAfterLoad();
-			}
-			return true;
-		}
 		if (g_prepID) {
-			Cleanup();
+			REX::INFO("forgetting {:08X} after a load (inventory untouched)", g_prepID);
 		}
-		return true;
+		g_copies.clear();
+		g_prepID = 0;
+		WriteWornFile(g_copies);
 	}
 
-	// ---------------- console command takeover ----------------
-	template <std::uint16_t N>
-	bool Hijack(std::string_view a_victim, const char* a_name, const char* a_short, const char* a_help,
-		RE::SCRIPT_PARAMETER (&a_params)[N], RE::SCRIPT_FUNCTION::Execute_t* a_fn)
+	// ---------------- bridge: what the UE4SS mod tells us ----------------
+	struct Bridge
 	{
-		auto cmd = RE::SCRIPT_FUNCTION::LocateConsoleCommand(a_victim);
-		if (!cmd) {
-			return false;
+		bool        valid = false;
+		bool        on = true;      // worn gear feature on
+		bool        sneak = false;  // player crouched
+		bool        menu = false;   // steal menu open
+		std::int64_t load = 0;      // +1 after every save load
+		std::int64_t area = 0;      // +1 after every area change (door / fast travel)
+		double      xp = 0.0;       // bonus XP total sent this session
+		float       penalty = 0.0f; // fPickPocketAmountBase to use right now
+		float       dist = 300.0f;
+		bool        skip = true;
+	};
+
+	std::mutex g_bridgeLock;
+	Bridge     g_bridge;
+
+	Bridge ReadBridgeFile()
+	{
+		Bridge        b;
+		std::ifstream file("PickpocketPlus_bridge.txt");
+		std::string   key;
+		bool          ended = false;
+		while (file >> key) {
+			if (key == "end") {
+				ended = true;
+				break;
+			}
+			double v = 0.0;
+			if (!(file >> v)) {
+				break;
+			}
+			if (key == "on") b.on = v != 0.0;
+			else if (key == "sneak") b.sneak = v != 0.0;
+			else if (key == "menu") b.menu = v != 0.0;
+			else if (key == "load") b.load = static_cast<std::int64_t>(v);
+			else if (key == "area") b.area = static_cast<std::int64_t>(v);
+			else if (key == "xp") b.xp = v;
+			else if (key == "pen") b.penalty = static_cast<float>(v);
+			else if (key == "dist") b.dist = static_cast<float>(v);
+			else if (key == "skip") b.skip = v != 0.0;
 		}
-		REX::INFO("replacing unused console command '{}' with {}", a_victim, a_name);
-		cmd->functionName = a_name;
-		cmd->shortName = a_short;
-		cmd->helpString = a_help;
-		cmd->referenceFunction = false;
-		cmd->SetParameters(a_params);
-		cmd->executeFunction = a_fn;
-		cmd->editorFilter = false;
-		return true;
+		b.valid = ended;  // only a fully written file counts
+		return b;
 	}
+
+	Bridge CurrentBridge()
+	{
+		std::lock_guard lock(g_bridgeLock);
+		return g_bridge;
+	}
+
+	// background thread: read the bridge, apply the worn penalty right away (works while menus are open)
+	void BridgeThread(std::stop_token a_stop)
+	{
+		RE::Setting* amountBase = nullptr;
+		float        applied = 1e9f;
+		while (!a_stop.stop_requested()) {
+			auto b = ReadBridgeFile();
+			if (b.valid) {
+				{
+					std::lock_guard lock(g_bridgeLock);
+					g_bridge = b;
+				}
+				if (!amountBase) {
+					if (auto gs = RE::GameSettingCollection::GetSingleton()) {
+						amountBase = gs->GetSetting("fPickPocketAmountBase");
+					}
+				}
+				if (amountBase && b.penalty != applied) {
+					amountBase->data.f = b.penalty;
+					applied = b.penalty;
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+	}
+
+	// ---------------- the per-frame work (inside the player's update) ----------------
+	std::int64_t      g_seenLoad = -1, g_seenArea = -1;
+	double            g_xpApplied = 0.0;
+	bool              g_menuWasOpen = false;
+	Clock::time_point g_nextTick{}, g_repairAt{}, g_cleanupAt{}, g_prepAllowedAt{}, g_standSince{};
+	bool              g_repairPending = false, g_cleanupPending = false, g_standing = false;
+
+	void ApplyXP(double a_total)
+	{
+		if (a_total < g_xpApplied) {
+			g_xpApplied = a_total;  // the UE4SS mod restarted its count
+		}
+		const double delta = a_total - g_xpApplied;
+		if (delta <= 0.0) {
+			return;
+		}
+		if (auto player = RE::PlayerCharacter::GetSingleton()) {
+			constexpr std::int32_t slot = kSneak - kFirstSkill;
+			player->skillUsage[slot] += static_cast<float>(delta);
+			REX::INFO("bonus XP +{:.3f} -> Sneak XP {:.3f} / {:.3f}", delta, player->skillUsage[slot], player->skillAdvancementUses[slot]);
+		}
+		g_xpApplied = a_total;
+	}
+
+	void Tick()
+	{
+		const auto now = Clock::now();
+		if (now < g_nextTick) {
+			return;
+		}
+		g_nextTick = now + std::chrono::milliseconds(250);
+
+		const auto b = CurrentBridge();
+		if (!b.valid) {
+			return;
+		}
+
+		ApplyXP(b.xp);
+
+		// a save was loaded: forget (the NPC was reloaded without our copies), repair saved copies a bit later
+		if (b.load != g_seenLoad) {
+			if (g_seenLoad != -1 || b.load > 0) {
+				Forget();
+				g_repairPending = true;
+				g_repairAt = now + std::chrono::seconds(3);
+				g_cleanupPending = false;
+			}
+			g_seenLoad = b.load;
+		}
+		// an area change: forget the old NPC (never touch an NPC right after a load/door - the ledger
+		// repair below removes any leftover copies safely, whether they still exist or not)
+		if (b.area != g_seenArea) {
+			if (g_seenArea != -1) {
+				Forget();
+				g_repairPending = true;
+				g_repairAt = now + std::chrono::seconds(2);
+			}
+			g_seenArea = b.area;
+		}
+		if (g_repairPending && now >= g_repairAt && !b.menu) {
+			g_repairPending = false;
+			RepairAfterLoad();
+		}
+
+		if (!b.on) {
+			if (g_prepID && !b.menu) {
+				Cleanup();
+			}
+			return;
+		}
+
+		// steal menu: leave everything alone while it's open; clean up shortly after it closes
+		if (b.menu) {
+			g_menuWasOpen = true;
+			return;
+		}
+		if (g_menuWasOpen) {
+			g_menuWasOpen = false;
+			g_cleanupPending = true;
+			g_cleanupAt = now + std::chrono::milliseconds(500);
+			g_prepAllowedAt = now + std::chrono::seconds(2);
+		}
+		if (g_cleanupPending) {
+			if (now < g_cleanupAt) {
+				return;
+			}
+			g_cleanupPending = false;
+			if (g_prepID) {
+				Cleanup();
+			}
+		}
+
+		if (b.sneak) {
+			g_standing = false;
+			if (now >= g_prepAllowedAt) {
+				Prepare(b.dist, b.skip);
+			}
+		} else if (g_prepID) {
+			// stood up: keep the copies 10 s (crouching again soon needs no remove + re-add)
+			if (!g_standing) {
+				g_standing = true;
+				g_standSince = now;
+			} else if (now - g_standSince > std::chrono::seconds(10)) {
+				Cleanup();
+				g_standing = false;
+			}
+		}
+	}
+
+	// ---------------- hooks ----------------
+	struct PlayerUpdateHook
+	{
+		static void Thunk(RE::PlayerCharacter* a_this, float a_delta)
+		{
+			func(a_this, a_delta);
+			Tick();
+		}
+		static inline REL::Relocation<decltype(Thunk)> func;
+	};
+
+	std::jthread g_bridgeThread;
 
 	void Install()
 	{
-		constexpr std::array victims{
-			"OutputMemContexts"sv, "OutputMemStats"sv, "OutputArchiveProfile"sv, "TestCode"sv,
-			"OutputLocalMapPictures"sv, "TestSeenData"sv
-		};
-		std::size_t next = 0;
-		auto take = [&](const char* a_name, const char* a_short, const char* a_help, auto& a_params, RE::SCRIPT_FUNCTION::Execute_t* a_fn) {
-			while (next < victims.size()) {
-				if (Hijack(victims[next++], a_name, a_short, a_help, a_params, a_fn)) {
-					return;
-				}
-			}
-			REX::ERROR("no free console command left for {}", a_name);
-		};
-
-		take("PPAddSneakXP", "ppxp", "PickpocketPlus: adds Sneak XP (PPAddSneakXP <amount>)", g_xpParams, &ExecuteAddXP);
-		take("PPPrepareTarget", "ppprep", "PickpocketPlus: copies the aimed NPC's worn items (PPPrepareTarget <maxDistance> <skipProtected>)", g_prepParams, &ExecutePrepare);
-		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes worn-item copies (PPCleanupTarget <0 normal | 1 forget | 2 forget + repair after load>)", g_cleanupParams, &ExecuteCleanup);
+		REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE::PlayerCharacter[0] };
+		PlayerUpdateHook::func = vtbl.write_vfunc(0x99, PlayerUpdateHook::Thunk);
+		REX::INFO("hooked the player update");
 		WriteWornFile(g_copies);  // start with an empty file
+		g_bridgeThread = std::jthread(BridgeThread);
 	}
 }
 
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.22 loaded");
+	REX::INFO("PickpocketPlus 0.24 loaded");
 	PPXP::Install();
 	return true;
 }
