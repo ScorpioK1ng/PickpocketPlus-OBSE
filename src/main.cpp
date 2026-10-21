@@ -1,4 +1,6 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.20
+// PickpocketPlus (OBSE64 plugin) — version 0.21
+// v0.21: the ledger keeps the LOWEST count ever seen for an NPC's item, so a save that already contained a
+//        copy can't raise the baseline (that's why Olav's extra clothes were never repaired).
 // v0.20: self-repair after loading a save: every NPC that got copies is remembered in PickpocketPlus_ledger.txt
 //        (NPC, item, count before the copy). "PPCleanupTarget 2" (sent after each load) removes any extra copies
 //        a save captured, so a save made with copies active heals itself on load.
@@ -301,8 +303,14 @@ namespace PPXP
 	void RememberCopy(RE::TESFormID a_npc, RE::TESFormID a_object, std::int32_t a_baseline)
 	{
 		auto list = LoadLedger();
+		std::int32_t baseline = a_baseline;
+		for (auto& e : list) {
+			if (e.npc == a_npc && e.object == a_object && e.baseline < baseline) {
+				baseline = e.baseline;  // never raise it: a loaded save may already hold a copy
+			}
+		}
 		std::erase_if(list, [&](const LedgerEntry& e) { return e.npc == a_npc && e.object == a_object; });
-		list.push_back({ a_npc, a_object, a_baseline });
+		list.push_back({ a_npc, a_object, baseline });
 		if (list.size() > kLedgerMax) {
 			list.erase(list.begin(), list.begin() + (list.size() - kLedgerMax));
 		}
@@ -550,7 +558,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.20 loaded");
+	REX::INFO("PickpocketPlus 0.21 loaded");
 	PPXP::Install();
 	return true;
 }
