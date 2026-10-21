@@ -1,57 +1,19 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.21
-// v0.21: the ledger keeps the LOWEST count ever seen for an NPC's item, so a save that already contained a
-//        copy can't raise the baseline (that's why Olav's extra clothes were never repaired).
-// v0.20: self-repair after loading a save: every NPC that got copies is remembered in PickpocketPlus_ledger.txt
-//        (NPC, item, count before the copy). "PPCleanupTarget 2" (sent after each load) removes any extra copies
-//        a save captured, so a save made with copies active heals itself on load.
-// v0.19: switching to another NPC while sneaking cleans up the old one and prepares the new one in the same
-//        call (the crashes turned out to be in the console, not in adding/removing items).
-// v0.18: the trace also records the start and end of every PickpocketPlus console command (the crash is in the
-//        game's console handling - this shows whether one of ours was running at that moment).
-// v0.17: targets the NPC in FRONT of you (within a 50° cone), the nearest one only as a fallback (crowded
-//        taverns picked the wrong NPC); writes PickpocketPlus_trace.txt right before and after every add /
-//        remove / equip call, so after a crash the last line shows exactly which call crashed.
-// v0.16: crash safety: every crash so far happened while changing an NPC's inventory shortly after a previous
-//        change (the NPC's AI still re-checking its gear). Now: copies are not added to an NPC within 5 s of
-//        their last cleanup, and an AI-removed piece is put back only after 2 s.
-// v0.15: a piece the AI took off (e.g. the shield) is put back after 0.5 s of settling instead of 2 s.
-// v0.14: "PPCleanupTarget 1" only forgets the prepared NPC without touching their inventory (used after a save
-//        is loaded: the reloaded NPC has no copies, so a normal cleanup would wrongly take real pieces).
-// v0.13: crash safety: a piece the AI took off is put back on only once, and only after the NPC has had
-//        2 s to settle after the copies were added (no tug-of-war with the AI).
-// v0.12: keeps the prepared NPC dressed: if the game's AI takes a real piece off after the copies were added
-//        (e.g. the shield), it is put back on (up to 3 tries per item) on the next prepare call.
-// v0.11: PickpocketPlus_worn.txt lines are "name|value|weight" (the UE4SS mod can match items by value and
-//        weight if the names differ from the menu's); each line is also logged.
-// v0.10: target = crosshair NPC if the game reports one, otherwise the nearest NPC in reach (the crosshair
-//        target turned out to be empty in the Remaster); dead/unconscious NPCs are never touched (no duplicate
-//        loot on corpses).
-// v0.9: worn gear via COPIES (the NPC stays dressed): while you sneak and aim at an NPC, PPPrepareTarget adds an
-//       unequipped copy of each worn item, so the steal menu lists them from the start. PPCleanupTarget removes
-//       the copies you left - or the real worn piece, if you stole its copy. Worn item names go to
-//       PickpocketPlus_worn.txt for the UE4SS mod. The undress method (PPStripTarget/PPRestoreTarget) is gone.
-// v0.8: quest/scripted items stay on. v0.4-0.7: XP written straight to Sneak experience, strip experiments.
-// v0.1-0.3: first version, build fixes.
+// PickpocketPlus (OBSE64 plugin) — version 0.22
+// Companion DLL for the PickpocketPlus UE4SS mod. Console commands (each takes over an unused debug command):
+//     PPAddSneakXP <amount>                         adds Sneak XP (game units: 2 per pickpocket)
+//     PPPrepareTarget <maxDistance> <skipProtected> adds unequipped copies of the worn items of the NPC in front
+//                                                   of you (worn gear shows in their steal menu, they stay dressed)
+//     PPCleanupTarget <0|1|2>                       0 = remove untaken copies / the real pieces you stole,
+//                                                   1 = forget after a load, 2 = forget + repair saved copies
 //
-// Console commands (each takes over an unused debug command):
-//     PPAddSneakXP <amount>                          adds Sneak XP (game units: 2 per pickpocket)
-//     PPPrepareTarget <maxDistance> <skipProtected>  copies the crosshair NPC's worn items into their inventory
-//     PPCleanupTarget                                removes leftover copies / stolen worn pieces
+// v0.22: cleanup: crash-hunt trace file and per-item log lines removed.
+// History: 0.1-0.4 Sneak XP; 0.5-0.8 worn gear by undressing; 0.9-0.21 worn gear via copies (targeting, AI
+// re-dress, quiet times, save repair ledger).
 
 namespace PPXP
 {
 	constexpr std::int32_t kSneak = 31;       // actor value index of Sneak
 	constexpr std::int32_t kFirstSkill = 12;  // TESDataHandler::skill[0] is Armorer (12)
-
-	// flushed line-by-line, so it survives a crash (the normal log may lose its last lines)
-	void Trace(const std::string& a_line)
-	{
-		static std::ofstream file("PickpocketPlus_trace.txt", std::ios::trunc);
-		if (file) {
-			const auto now = std::chrono::system_clock::now();
-			file << std::format("{:%H:%M:%S} {}", std::chrono::floor<std::chrono::milliseconds>(now), a_line) << std::endl;
-		}
-	}
 
 	// ---------------- Sneak XP ----------------
 	RE::SCRIPT_PARAMETER g_xpParams[] = {
@@ -62,8 +24,6 @@ namespace PPXP
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
-		Trace("cmd PPAddSneakXP start");
-		struct TraceEnd { ~TraceEnd() { Trace("cmd PPAddSneakXP end"); } } traceEnd;
 		a_result = 0.0;
 		float amount = 0.0f;
 		if (!RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &amount)) {
@@ -268,7 +228,6 @@ namespace PPXP
 			}
 			const auto line = std::format("{}|{}|{:.2f}", NameOf(c.object), value, weight);
 			file << line << "\n";
-			REX::INFO("  worn copy: {}", line);
 		}
 	}
 
@@ -330,9 +289,7 @@ namespace PPXP
 			auto object = static_cast<RE::TESBoundObject*>(form);
 			const std::int32_t now = npc->GetItemCountInContainer(object);
 			for (std::int32_t extra = now - e.baseline; extra > 0; --extra) {
-				Trace(std::format("repair: remove saved copy {:08X} from {:08X}", e.object, e.npc));
 				npc->RemoveItem(object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
-				Trace("  done");
 				++repaired;
 			}
 			if (now > e.baseline && !WornListOf(npc, object) && npc->GetItemCountInContainer(object) > 0) {
@@ -351,26 +308,18 @@ namespace PPXP
 				const std::int32_t now = npc->GetItemCountInContainer(c.object);
 				if (now >= c.countWithCopy) {
 					// copy still there: remove it, and make sure the real piece is still worn
-					Trace(std::format("remove copy {:08X} from {:08X}", c.object->formID, g_prepID));
 					npc->RemoveItem(c.object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
-					Trace("  done");
 					++removedCopies;
 					if (!WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
-						Trace(std::format("re-equip {:08X} on {:08X}", c.object->formID, g_prepID));
 						npc->EquipObject(c.object, 1, nullptr);
-						Trace("  done");
 					}
 				} else {
 					// the copy was stolen: the real worn piece goes too
 					if (auto worn = WornListOf(npc, c.object)) {
-						Trace(std::format("unequip stolen {:08X} on {:08X}", c.object->formID, g_prepID));
 						npc->UnequipObject(c.object, 1, worn, true);
-						Trace("  done");
 					}
 					if (npc->GetItemCountInContainer(c.object) > 0) {
-						Trace(std::format("remove stolen {:08X} from {:08X}", c.object->formID, g_prepID));
 						npc->RemoveItem(c.object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
-						Trace("  done");
 					}
 					++takenWorn;
 					REX::INFO("  {:08X} was stolen - real worn piece removed", c.object->formID);
@@ -389,8 +338,6 @@ namespace PPXP
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
-		Trace("cmd PPPrepareTarget start");
-		struct TraceEnd { ~TraceEnd() { Trace("cmd PPPrepareTarget end"); } } traceEnd;
 		a_result = 0.0;
 		float        maxDist = 300.0f;
 		std::int32_t skipProtected = 1;
@@ -428,9 +375,7 @@ namespace PPXP
 			for (auto& c : g_copies) {
 				if (c.redressTries < 1 && !WornListOf(npc, c.object) && npc->GetItemCountInContainer(c.object) > 0) {
 					++c.redressTries;
-					Trace(std::format("put back {:08X} on {:08X}", c.object->formID, npc->formID));
 					npc->EquipObject(c.object, 1, nullptr);
-					Trace("  done");
 					REX::INFO("  {:08X} was taken off by the AI - put back on", c.object->formID);
 				}
 			}
@@ -473,9 +418,7 @@ namespace PPXP
 		g_copies.clear();
 		for (auto object : worn) {
 			RememberCopy(npc->formID, object->formID, npc->GetItemCountInContainer(object));
-			Trace(std::format("add copy {:08X} to {:08X}", object->formID, npc->formID));
 			npc->AddObjectToContainer(object, nullptr, 1);
-			Trace("  done");
 			g_copies.push_back({ object, npc->GetItemCountInContainer(object) });
 		}
 		WriteWornFile(g_copies);
@@ -488,8 +431,6 @@ namespace PPXP
 		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
 		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
 	{
-		Trace("cmd PPCleanupTarget start");
-		struct TraceEnd { ~TraceEnd() { Trace("cmd PPCleanupTarget end"); } } traceEnd;
 		a_result = 0.0;
 		std::int32_t forgetOnly = 0;
 		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &forgetOnly);
@@ -558,7 +499,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.21 loaded");
+	REX::INFO("PickpocketPlus 0.22 loaded");
 	PPXP::Install();
 	return true;
 }
