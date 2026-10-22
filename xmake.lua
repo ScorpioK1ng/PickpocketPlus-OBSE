@@ -1,10 +1,11 @@
--- PickpocketPlus (OBSE64 plugin) — version 0.29
+-- PickpocketPlus (OBSE64 plugin) — version 0.30
 -- Companion DLL for the PickpocketPlus UE4SS mod: bonus Sneak XP and worn-gear copies (console commands for items, status file for XP/penalty).
+-- Flat layout: main.cpp and pch.h sit in the main folder next to this file (the old src folder is ignored).
 
 includes("lib/commonlibob64")
 
 set_project("PickpocketPlus")
-set_version("0.29.0")
+set_version("0.30.0")
 set_license("GPL-3.0")
 set_languages("c++23")
 set_warnings("allextra")
@@ -17,7 +18,7 @@ target("PickpocketPlus")
         author = "Solo",
         description = "PickpocketPlus: bonus Sneak XP and worn-gear stealing for the PickpocketPlus UE4SS mod"
     })
-    add_files("src/**.cpp")
-    add_headerfiles("src/**.h")
-    add_includedirs("src")
-    set_pcxxheader("src/pch.h")
+    add_files("main.cpp")
+    add_headerfiles("pch.h")
+    add_includedirs(".")
+    set_pcxxheader("pch.h")
