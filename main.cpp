@@ -1,4 +1,4 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.32
+// PickpocketPlus (OBSE64 plugin) — version 0.33
 // Companion DLL for the PickpocketPlus UE4SS mod.
 //   The UE4SS mod sends its requests (copy / cleanup) through PickpocketPlus_bridge.txt; they are carried out
 //   inside the player's own update, on the game's Oblivion thread (checked by name before any item is touched).
@@ -11,6 +11,10 @@
 //   Without console (frequent things): bonus Sneak XP and the worn penalty come from PickpocketPlus_bridge.txt,
 //   written by the UE4SS mod; a background reader applies the penalty, the XP is added on the game thread.
 //
+// v0.33: 0.32's player-update hook was never called in the Remaster, so requests never ran (no copies, no crash).
+//        Requests now run from whichever per-frame hook fires on OblivionThread: the HUD's DoIdle (Oblivion idles its
+//        active menus every frame) or the player update. Each hook logs its first call and thread; requests that
+//        wait over 10 s are reported in the log.
 // v0.32: no console commands any more. Both console crashes ran the command on a background worker thread
 //        ("Foreground Worker #0"), while every command that worked ran on "OblivionThread". Requests now come
 //        through the bridge file and run inside PlayerCharacter::Update, only if that is OblivionThread.
@@ -594,6 +598,8 @@ namespace PPXP
 	std::mutex           g_requestLock;
 	std::vector<Request> g_requests;
 	std::uint64_t        g_lastReqSeq = 0;
+	std::atomic<bool>    g_pending{ false };  // requests waiting (cheap check for the per-frame hooks)
+	std::atomic<int>     g_hooksSeen{ 0 };     // hooks that have been called at least once
 
 	std::mutex g_bridgeLock;
 	Bridge     g_bridge;
@@ -665,7 +671,13 @@ namespace PPXP
 		int          loops = 0;
 		const auto   started = std::filesystem::file_time_type::clock::now();
 		auto         readyAt = Clock::time_point::max();
+		auto         pendingSince = Clock::now();
+		bool         waitWarned = false;
 		while (!a_stop.stop_requested()) {
+			if (g_pending && !waitWarned && Clock::now() - pendingSince > std::chrono::seconds(10)) {
+				waitWarned = true;
+				REX::WARN("requests have been waiting 10 s: no hook on OblivionThread has run them ({} hook(s) called so far)", g_hooksSeen.load());
+			}
 			auto b = ReadBridgeFile();
 			if (b.valid) {
 				// only a status file written in THIS session counts (an old one is still on disk at startup)
@@ -694,6 +706,10 @@ namespace PPXP
 					std::lock_guard lock(g_requestLock);
 					if (g_requests.size() < 16) {
 						g_requests.push_back({ b.reqType, b.reqA, b.reqB });
+					}
+					if (!g_pending.exchange(true)) {
+						pendingSince = Clock::now();
+						waitWarned = false;
 					}
 				}
 				if (!amountBase) {
@@ -750,7 +766,7 @@ namespace PPXP
 	}
 
 	// true only on the thread named "OblivionThread" (checked once per thread)
-	bool OnOblivionThread()
+	bool OnOblivionThread(const char* a_from)
 	{
 		static std::uint32_t lastId = 0;
 		static bool          lastOk = false;
@@ -762,24 +778,26 @@ namespace PPXP
 			lastOk = (name == "OblivionThread");
 			if (reports < 5) {
 				++reports;
-				REX::INFO("player update runs on thread {} '{}' - requests {}", id, name, lastOk ? "allowed" : "NOT run here");
+				REX::INFO("{}: thread {} '{}' - requests {}", a_from, id, name, lastOk ? "allowed" : "NOT run here");
 			}
 		}
 		return lastOk;
 	}
 
-	void RunRequests()
+	// called every frame by the hooks: does nothing unless a request is waiting
+	void RunRequests(const char* a_from)
 	{
+		if (!g_pending.load(std::memory_order_relaxed)) {
+			return;
+		}
+		if (!OnOblivionThread(a_from)) {
+			return;  // keep them for a call on the right thread
+		}
 		std::vector<Request> todo;
 		{
 			std::lock_guard lock(g_requestLock);
-			if (g_requests.empty()) {
-				return;
-			}
-			if (!OnOblivionThread()) {
-				return;  // keep them for a call on the right thread
-			}
 			todo.swap(g_requests);
+			g_pending = false;
 		}
 		for (const auto& r : todo) {
 			if (r.type == 1) {
@@ -790,20 +808,46 @@ namespace PPXP
 		}
 	}
 
+	// first call of each hook: log which thread it runs on (proof the hook works)
+	void ReportFirstCall(std::atomic<bool>& a_seen, const char* a_hook)
+	{
+		if (!a_seen.exchange(true)) {
+			++g_hooksSeen;
+			REX::INFO("{} hook: first call, thread {} '{}'", a_hook, REX::W32::GetCurrentThreadId(), CurrentThreadName());
+		}
+	}
+
 	using PlayerUpdate_t = void (*)(RE::PlayerCharacter*, float);
 	PlayerUpdate_t g_playerUpdate = nullptr;
+
+	std::atomic<bool> g_playerSeen{ false };
 
 	void PlayerUpdateHook(RE::PlayerCharacter* a_this, float a_delta)
 	{
 		g_playerUpdate(a_this, a_delta);
-		RunRequests();
+		ReportFirstCall(g_playerSeen, "player update");
+		RunRequests("player update");
+	}
+
+	// Oblivion idles its active menus every frame; the HUD is active whenever you play
+	using MenuIdle_t = void (*)(void*);
+	MenuIdle_t        g_hudIdle = nullptr;
+	std::atomic<bool> g_hudSeen{ false };
+
+	void HUDIdleHook(void* a_this)
+	{
+		g_hudIdle(a_this);
+		ReportFirstCall(g_hudSeen, "HUD idle");
+		RunRequests("HUD idle");
 	}
 
 	void InstallUpdateHook()
 	{
-		REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE::PlayerCharacter[0] };
-		g_playerUpdate = reinterpret_cast<PlayerUpdate_t>(vtbl.write_vfunc(0x99, &PlayerUpdateHook));
-		REX::INFO("player update hook installed");
+		REL::Relocation<std::uintptr_t> hudVtbl{ RE::VTABLE::HUDMainMenu[0] };
+		g_hudIdle = reinterpret_cast<MenuIdle_t>(hudVtbl.write_vfunc(0x12, &HUDIdleHook));
+		REL::Relocation<std::uintptr_t> playerVtbl{ RE::VTABLE::PlayerCharacter[0] };
+		g_playerUpdate = reinterpret_cast<PlayerUpdate_t>(playerVtbl.write_vfunc(0x99, &PlayerUpdateHook));
+		REX::INFO("hooks installed: HUD idle, player update (requests run on OblivionThread only)");
 	}
 
 	// ---------------- console command takeover ----------------
@@ -854,7 +898,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.32 loaded");
+	REX::INFO("PickpocketPlus 0.33 loaded");
 	PPXP::Install();
 	return true;
 }
