@@ -1,4 +1,4 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.30
+// PickpocketPlus (OBSE64 plugin) — version 0.31
 // Companion DLL for the PickpocketPlus UE4SS mod.
 //   Console commands (used only a few times per robbery, at calm moments):
 //     PPPrepareTarget <maxDistance> <skipProtected> adds unequipped copies of the worn items of the NPC in front
@@ -9,6 +9,11 @@
 //   Without console (frequent things): bonus Sneak XP and the worn penalty come from PickpocketPlus_bridge.txt,
 //   written by the UE4SS mod; a background reader applies the penalty, the XP is added on the game thread.
 //
+// v0.31: copies are judged by the NPC's real inventory, not only the ledger: "a copy is there" now means an
+//        unequipped one of that item exists. After reloading an older save (NPC dressed again, ledger still
+//        saying "robbed") a fresh copy is added again - before, nothing was added and no worn items showed.
+//        The worn-items file is rewritten after a steal menu too (no stale names), and the dead-NPC sweep only
+//        ever removes unequipped pieces.
 // v0.30: copies are added ONCE per NPC and never taken back (no more add/remove churn): only the real piece of a
 //        stolen copy is removed; dead NPCs lose their copies. Held weapons: the copy gets its own condition (1 point
 //        below new) so it never merges with the held weapon's hidden stack and always shows in the steal menu.
@@ -202,6 +207,33 @@ namespace PPXP
 		return nullptr;
 	}
 
+	// how many instances of an item the NPC wears (usually 0 or 1)
+	std::int32_t WornCountOf(RE::Actor* a_npc, RE::TESBoundObject* a_object)
+	{
+		std::int32_t worn = 0;
+		auto         changes = ChangesOf(a_npc);
+		if (!changes) {
+			return 0;
+		}
+		for (auto change : *changes->list) {
+			if (change && change->object == a_object && change->extraData) {
+				for (auto xList : *change->extraData) {
+					if (IsWornList(xList)) {
+						++worn;
+					}
+				}
+			}
+		}
+		return worn;
+	}
+
+	// unequipped pieces of an item in the NPC's pack (these are what the steal menu lists)
+	std::int32_t LooseCountOf(RE::Actor* a_npc, RE::TESBoundObject* a_object)
+	{
+		const std::int32_t loose = a_npc->GetItemCountInContainer(a_object) - WornCountOf(a_npc, a_object);
+		return loose > 0 ? loose : 0;
+	}
+
 	// names for the UE4SS mod (it marks these items in the steal list)
 	std::string NameOf(RE::TESBoundObject* a_object)
 	{
@@ -316,7 +348,8 @@ namespace PPXP
 		return worn;
 	}
 
-	// names (+ value, weight) of the items that currently have a copy, for the UE4SS mod's marks
+	// names (+ value, weight) of the items that currently have a copy, for the UE4SS mod's marks:
+	// worn items (from the ledger, i.e. ones we copied) that also have an unequipped piece in the pack
 	void WriteWornFile(RE::Actor* a_npc)
 	{
 		std::ofstream file("PickpocketPlus_worn.txt", std::ios::trunc);
@@ -328,8 +361,8 @@ namespace PPXP
 				continue;
 			}
 			auto object = static_cast<RE::TESBoundObject*>(RE::TESForm::LookupByID(e.object));
-			if (!object || a_npc->GetItemCountInContainer(object) <= e.baseline) {
-				continue;  // no copy right now
+			if (!object || !WornListOf(a_npc, object) || LooseCountOf(a_npc, object) < 1) {
+				continue;  // not worn any more, or no copy right now
 			}
 			std::uint32_t value = 0;
 			float         weight = 0.0f;
@@ -381,19 +414,21 @@ namespace PPXP
 		bool ledgerChanged = false;
 		for (auto object : WornItems(npc, skipProtected != 0)) {
 			const std::int32_t now = npc->GetItemCountInContainer(object);
+			const bool         hasCopy = LooseCountOf(npc, object) >= 1;  // the NPC's real inventory decides
+			// baseline = count without the copy (self-correcting: the ledger may come from another save)
+			const std::int32_t baseline = hasCopy ? now - 1 : now;
 			auto               entry = FindEntry(npc->formID, object->formID);
 			if (!entry) {
-				Ledger().push_back({ npc->formID, object->formID, now });
+				Ledger().push_back({ npc->formID, object->formID, baseline });
 				entry = &Ledger().back();
 				ledgerChanged = true;
+			} else if (entry->baseline != baseline) {
+				entry->baseline = baseline;
+				ledgerChanged = true;
 			}
-			if (now > entry->baseline) {
+			if (hasCopy) {
 				g_hadCopy.insert({ npc->formID, object->formID });
 				continue;  // the copy is already there
-			}
-			if (now < entry->baseline) {
-				entry->baseline = now;  // they have fewer than before (e.g. an older save): adjust
-				ledgerChanged = true;
 			}
 			RE::ExtraDataList* condition = object->Is(RE::FormType::Weapon) ? MakeConditionList(object) : nullptr;
 			npc->AddObjectToContainer(object, condition, 1);
@@ -459,6 +494,7 @@ namespace PPXP
 		if (changed) {
 			SaveLedger();
 		}
+		WriteWornFile(a_npc);  // no stale names if their steal menu is opened again
 		if (taken) {
 			REX::INFO("PPCleanupTarget: {:08X}: {} worn pieces taken", a_npc->formID, taken);
 		}
@@ -482,7 +518,9 @@ namespace PPXP
 			if (!object) {
 				continue;
 			}
-			for (std::int32_t extra = npc->GetItemCountInContainer(object) - e.baseline; extra > 0; --extra) {
+			// only unequipped pieces can be copies (never strip what the corpse wears)
+			std::int32_t extra = std::min(npc->GetItemCountInContainer(object) - e.baseline, LooseCountOf(npc, object));
+			for (; extra > 0; --extra) {
 				npc->RemoveItem(object, nullptr, 1, false, false, nullptr, nullptr, nullptr, true, false);
 				++removed;
 				changed = true;
@@ -683,7 +721,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.30 loaded");
+	REX::INFO("PickpocketPlus 0.31 loaded");
 	PPXP::Install();
 	return true;
 }
