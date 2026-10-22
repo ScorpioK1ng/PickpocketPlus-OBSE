@@ -1,6 +1,8 @@
-// PickpocketPlus (OBSE64 plugin) — version 0.31
+// PickpocketPlus (OBSE64 plugin) — version 0.32
 // Companion DLL for the PickpocketPlus UE4SS mod.
-//   Console commands (used only a few times per robbery, at calm moments):
+//   The UE4SS mod sends its requests (copy / cleanup) through PickpocketPlus_bridge.txt; they are carried out
+//   inside the player's own update, on the game's Oblivion thread (checked by name before any item is touched).
+//   The console commands below still exist, but only for manual testing:
 //     PPPrepareTarget <maxDistance> <skipProtected> adds unequipped copies of the worn items of the NPC in front
 //                                                   of you (worn gear shows in their steal menu, they stay dressed)
 //     PPCleanupTarget <0|1|3>                       0 = after a steal menu: remove the real pieces you stole,
@@ -9,6 +11,9 @@
 //   Without console (frequent things): bonus Sneak XP and the worn penalty come from PickpocketPlus_bridge.txt,
 //   written by the UE4SS mod; a background reader applies the penalty, the XP is added on the game thread.
 //
+// v0.32: no console commands any more. Both console crashes ran the command on a background worker thread
+//        ("Foreground Worker #0"), while every command that worked ran on "OblivionThread". Requests now come
+//        through the bridge file and run inside PlayerCharacter::Update, only if that is OblivionThread.
 // v0.31: copies are judged by the NPC's real inventory, not only the ledger: "a copy is there" now means an
 //        unequipped one of that item exists. After reloading an older save (NPC dressed again, ledger still
 //        saying "robbed") a fresh copy is added again - before, nothing was added and no worn items showed.
@@ -381,15 +386,9 @@ namespace PPXP
 		std::ofstream file("PickpocketPlus_worn.txt", std::ios::trunc);
 	}
 
-	// ---------------- PPPrepareTarget: copies for the NPC in front of you (only what's missing) ----------------
-	bool ExecutePrepare(
-		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
-		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
+	// ---------------- prepare: copies for the NPC in front of you (only what's missing) ----------------
+	int DoPrepare(float maxDist, std::int32_t skipProtected)
 	{
-		a_result = 0.0;
-		float        maxDist = 300.0f;
-		std::int32_t skipProtected = 1;
-		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &maxDist, &skipProtected);
 		if (maxDist <= 0.0f) {
 			maxDist = 300.0f;
 		}
@@ -406,7 +405,7 @@ namespace PPXP
 			npc = FindNearestNPC(maxDist);
 		}
 		if (!npc) {
-			return true;
+			return 0;
 		}
 		g_targetID = npc->formID;
 
@@ -456,7 +455,18 @@ namespace PPXP
 		if (added) {
 			REX::INFO("PPPrepareTarget: {:08X}: {} copies added (only missing ones)", npc->formID, added);
 		}
-		a_result = added;
+		return added;
+	}
+
+	// console version (manual testing only)
+	bool ExecutePrepare(
+		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
+		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
+	{
+		float        maxDist = 300.0f;
+		std::int32_t skipProtected = 1;
+		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &maxDist, &skipProtected);
+		a_result = DoPrepare(maxDist, skipProtected);
 		return true;
 	}
 
@@ -533,13 +543,8 @@ namespace PPXP
 	}
 
 	// PPCleanupTarget <mode>: 0 = after a steal menu, 1 = after a load / area change, 3 = dead-NPC sweep only
-	bool ExecuteCleanup(
-		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
-		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
+	void DoCleanup(std::int32_t mode)
 	{
-		a_result = 0.0;
-		std::int32_t mode = 0;
-		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &mode);
 		if (mode == 0) {
 			if (auto npc = LookupNPC(g_targetID); npc && npc->parentCell) {
 				SettleStolen(npc);
@@ -551,6 +556,17 @@ namespace PPXP
 			ClearWornFile();
 		}
 		SweepDead();
+	}
+
+	// console version (manual testing only)
+	bool ExecuteCleanup(
+		const RE::SCRIPT_PARAMETER* a_parameters, const char* a_compiledParams, RE::TESObjectREFR* a_refObject,
+		RE::TESObjectREFR* a_container, RE::Script* a_script, RE::ScriptLocals* a_scriptLocals, double& a_result, std::uint32_t& a_offset)
+	{
+		a_result = 0.0;
+		std::int32_t mode = 0;
+		RE::Script::ParseParameters(a_parameters, a_compiledParams, a_offset, a_refObject, a_container, a_script, a_scriptLocals, &mode);
+		DoCleanup(mode);
 		return true;
 	}
 
@@ -559,10 +575,25 @@ namespace PPXP
 
 	struct Bridge
 	{
-		bool   valid = false;
-		double xp = 0.0;        // bonus XP total sent this session
-		float  penalty = 0.0f;  // fPickPocketAmountBase to use right now
+		bool          valid = false;
+		double        xp = 0.0;        // bonus XP total sent this session
+		float         penalty = 0.0f;  // fPickPocketAmountBase to use right now
+		std::uint64_t reqSeq = 0;      // latest request: number (0 = none), type (1 prepare, 2 cleanup), 2 values
+		int           reqType = 0;
+		double        reqA = 0.0;
+		double        reqB = 0.0;
 	};
+
+	// requests from the UE4SS mod, carried out in the player's update on the Oblivion thread
+	struct Request
+	{
+		int    type;
+		double a;
+		double b;
+	};
+	std::mutex           g_requestLock;
+	std::vector<Request> g_requests;
+	std::uint64_t        g_lastReqSeq = 0;
 
 	std::mutex g_bridgeLock;
 	Bridge     g_bridge;
@@ -577,6 +608,12 @@ namespace PPXP
 			if (key == "end") {
 				ended = true;
 				break;
+			}
+			if (key == "req") {
+				if (!(file >> b.reqSeq >> b.reqType >> b.reqA >> b.reqB)) {
+					break;
+				}
+				continue;
 			}
 			double v = 0.0;
 			if (!(file >> v)) {
@@ -648,6 +685,17 @@ namespace PPXP
 					std::lock_guard lock(g_bridgeLock);
 					g_bridge = b;
 				}
+				// a new request: queue it for the player's update (the UE4SS mod sends at most ~3 per second)
+				if (b.reqSeq != 0 && b.reqSeq != g_lastReqSeq) {
+					if (b.reqSeq > g_lastReqSeq + 1 && g_lastReqSeq != 0) {
+						REX::WARN("{} request(s) were replaced before they were read", b.reqSeq - g_lastReqSeq - 1);
+					}
+					g_lastReqSeq = b.reqSeq;  // (also covers a restarted UE4SS mod: its numbers start over)
+					std::lock_guard lock(g_requestLock);
+					if (g_requests.size() < 16) {
+						g_requests.push_back({ b.reqType, b.reqA, b.reqB });
+					}
+				}
 				if (!amountBase) {
 					if (auto gs = RE::GameSettingCollection::GetSingleton()) {
 						amountBase = gs->GetSetting("fPickPocketAmountBase");
@@ -673,6 +721,90 @@ namespace PPXP
 	}
 
 	std::jthread g_bridgeThread;
+
+	// ---------------- the player's update: requests run here, on the Oblivion thread ----------------
+	using GetThreadDescription_t = std::int32_t (*)(void*, wchar_t**);
+	using GetCurrentThread_t = void* (*)();
+	using LocalFree_t = void* (*)(void*);
+
+	std::string CurrentThreadName()
+	{
+		static auto k32 = REX::W32::GetModuleHandleW(L"kernel32.dll");
+		static auto getDesc = k32 ? reinterpret_cast<GetThreadDescription_t>(REX::W32::GetProcAddress(k32, "GetThreadDescription")) : nullptr;
+		static auto getCur = k32 ? reinterpret_cast<GetCurrentThread_t>(REX::W32::GetProcAddress(k32, "GetCurrentThread")) : nullptr;
+		static auto localFree = k32 ? reinterpret_cast<LocalFree_t>(REX::W32::GetProcAddress(k32, "LocalFree")) : nullptr;
+		if (!getDesc || !getCur) {
+			return {};
+		}
+		wchar_t* desc = nullptr;
+		std::string name;
+		if (getDesc(getCur(), &desc) >= 0 && desc) {
+			for (auto p = desc; *p; ++p) {
+				name.push_back(*p < 128 ? static_cast<char>(*p) : '?');
+			}
+			if (localFree) {
+				localFree(desc);
+			}
+		}
+		return name;
+	}
+
+	// true only on the thread named "OblivionThread" (checked once per thread)
+	bool OnOblivionThread()
+	{
+		static std::uint32_t lastId = 0;
+		static bool          lastOk = false;
+		static int           reports = 0;
+		const auto           id = REX::W32::GetCurrentThreadId();
+		if (id != lastId) {
+			lastId = id;
+			const auto name = CurrentThreadName();
+			lastOk = (name == "OblivionThread");
+			if (reports < 5) {
+				++reports;
+				REX::INFO("player update runs on thread {} '{}' - requests {}", id, name, lastOk ? "allowed" : "NOT run here");
+			}
+		}
+		return lastOk;
+	}
+
+	void RunRequests()
+	{
+		std::vector<Request> todo;
+		{
+			std::lock_guard lock(g_requestLock);
+			if (g_requests.empty()) {
+				return;
+			}
+			if (!OnOblivionThread()) {
+				return;  // keep them for a call on the right thread
+			}
+			todo.swap(g_requests);
+		}
+		for (const auto& r : todo) {
+			if (r.type == 1) {
+				DoPrepare(static_cast<float>(r.a), static_cast<std::int32_t>(r.b));
+			} else if (r.type == 2) {
+				DoCleanup(static_cast<std::int32_t>(r.a));
+			}
+		}
+	}
+
+	using PlayerUpdate_t = void (*)(RE::PlayerCharacter*, float);
+	PlayerUpdate_t g_playerUpdate = nullptr;
+
+	void PlayerUpdateHook(RE::PlayerCharacter* a_this, float a_delta)
+	{
+		g_playerUpdate(a_this, a_delta);
+		RunRequests();
+	}
+
+	void InstallUpdateHook()
+	{
+		REL::Relocation<std::uintptr_t> vtbl{ RE::VTABLE::PlayerCharacter[0] };
+		g_playerUpdate = reinterpret_cast<PlayerUpdate_t>(vtbl.write_vfunc(0x99, &PlayerUpdateHook));
+		REX::INFO("player update hook installed");
+	}
 
 	// ---------------- console command takeover ----------------
 	template <std::uint16_t N>
@@ -714,6 +846,7 @@ namespace PPXP
 		take("PPPrepareTarget", "ppprep", "PickpocketPlus: copies the aimed NPC's worn items (PPPrepareTarget <maxDistance> <skipProtected>)", g_prepParams, &ExecutePrepare);
 		take("PPCleanupTarget", "ppclean", "PickpocketPlus: removes worn-item copies (PPCleanupTarget <0 normal | 1 forget | 2 forget + repair after load>)", g_cleanupParams, &ExecuteCleanup);
 		ClearWornFile();  // start with an empty file
+		InstallUpdateHook();
 		g_bridgeThread = std::jthread(BridgeThread);
 	}
 }
@@ -721,7 +854,7 @@ namespace PPXP
 OBSE_PLUGIN_LOAD(const OBSE::LoadInterface* a_obse)
 {
 	OBSE::Init(a_obse);
-	REX::INFO("PickpocketPlus 0.31 loaded");
+	REX::INFO("PickpocketPlus 0.32 loaded");
 	PPXP::Install();
 	return true;
 }
